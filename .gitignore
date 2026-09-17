@@ -46,9 +46,9 @@ pnpm-debug.log*
 outputs/*
 !outputs/.gitkeep
 
-# 修改说明备忘（docs/mem）：纯本地协作记录，不上传；保留 .gitkeep 占位目录结构
-docs/mem/*
-!docs/mem/.gitkeep
+# 内部协作文件不进仓（AGENTS.md / docs/mem）：本地也不保留，防误提交
+AGENTS.md
+docs/mem/
 
 # 内置 opencode 二进制：约 180MB，按机配给（tools/opencode/install.ps1 + version.txt），不进 git
 tools/opencode/opencode.exe
