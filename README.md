@@ -117,6 +117,8 @@ docs/                   # 设计文档（下表）
 | 04 | `docs/04-drama-pipeline-tts.md` | script.json/60s+ 估算/一致性/TTS 矩阵/ffmpeg/重试 |
 | 05 | `docs/05-opencode-config.md` | 双源注册/models/全开放配置/内置 opencode/drama-director 校验 |
 
+`docs/mem/` 为每次修改的说明记录（本地协作记录，不上传）。
+
 ## 验证
 
 ```powershell
