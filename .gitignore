@@ -1,0 +1,73 @@
+# === free-ai-video ===
+# 安全红线（docs/03 §3.5）：KEK/API Key 明文/机器码明文绝不进 git；
+# 本地 env（含激活引用 ID）不进 git，模板 .env.example 进 git
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# 密钥库与本地秘密（防误放仓库；生产默认在 %APPDATA%/free-ai-video/keys_encrypted.db）
+*.db
+*.sqlite
+*.sqlite3
+keys_encrypted.db
+auth.json
+.opencode/auth.json
+
+# Python（后端 Python 3.14）
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+backend/dist/
+backend/build/
+
+# 前端（Vue3+Vite；package-lock.json 要提交，dist 不提交）
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# 产物目录（保留 .gitkeep 占位；script.json/state.json/mp4/png 全部本地）
+outputs/*
+!outputs/.gitkeep
+
+# 内置 opencode 二进制：约 180MB，按机配给（tools/opencode/install.ps1 + version.txt），不进 git
+tools/opencode/opencode.exe
+
+# 根目录 C++ 版设计文档：本地保留，不上传
+API密钥池生命周期管理与安全调度策略设计文档(C++版).md
+
+# 本地索引与 Agent 依赖（可重建；.codegraph/.opencode 内部已有 .gitignore，此处显式声明）
+.codegraph/
+.opencode/node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志
+*.log
+logs/

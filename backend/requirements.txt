@@ -1,0 +1,12 @@
+# free-ai-video backend 依赖锁定（Python 3.14，requires-python >= 3.14）。
+# 安装：pip install -r backend/requirements.txt
+fastapi>=0.115.0
+uvicorn>=0.30.0
+sse-starlette>=2.1.0
+pydantic>=2.10.0
+pydantic-settings>=2.5.0
+PyYAML>=6.0.2
+cryptography>=44.0.0
+httpx>=0.28.0
+edge-tts>=6.1.0
+pytest>=8.0.0

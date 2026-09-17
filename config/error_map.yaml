@@ -1,0 +1,31 @@
+# 429 三级分类（docs/02 §2.6）：启发式、待实采校准。
+# 只依赖 status + Retry-After + body 关键词；判定顺序 C → B → A。
+# 无 Retry-After 的 429 默认走 A 并按 defaults.bare_429_backoff_seconds 退避，避免误杀进 0。
+version: 1
+
+C_revoked: # 作废：人工处理
+  match:
+    status: [401, 403]
+    body_keywords: [invalid, unauthorized, revoked]
+  action:
+    set: {revoked: true}
+    note: 作废，需人工解绑
+
+B_exhausted: # 配额用光：进 0，等 24h 滚动重置
+  match:
+    status: [429, 403]
+    body_keywords: [quota, exhausted, limit_reached]
+  action:
+    set: {status: 0}
+    note: 配额用光，进0等24h滚动重置
+
+A_cooldown: # 瞬时限流：冷却，不进 0，切下一 Key 重试
+  match:
+    status: [429]
+    has_retry_after: true
+  action:
+    set: {cooldown_until: now+RetryAfter, status: 2}
+    note: 瞬时限流，冷却后回2，切下一Key重试
+
+defaults:
+  bare_429_backoff_seconds: 60

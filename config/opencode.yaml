@@ -1,0 +1,5 @@
+# opencode 二进制选择（docs/05 §5.8）。无秘密值，可进 git。
+# 优先级：请求级 bin_path > ENV(OPENCODE_BIN/OPENCODE_MODE) > 本文件。
+# 设置页 POST /api/opencode/select 写入本文件（默认 builtin）。
+mode: builtin   # builtin | system | custom | auto
+bin_path: ""    # custom 模式必填：opencode 可执行文件绝对路径
