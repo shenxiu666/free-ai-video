@@ -23,6 +23,28 @@
 - Node.js 18+（前端），Python 3.14（后端），FFmpeg（合成，`ffmpeg -version` 可用即可）
 - Windows 用 PowerShell
 
+## 克隆后补齐（首次一次）
+
+以下东西故意不进 git（见根 `.gitignore`：密钥防泄漏、二进制/依赖体积大、产物本地生成），克隆后按表补齐即可：
+
+| 没上传的东西 | 为什么 | 补齐命令（仓库根，PowerShell） |
+|---|---|---|
+| Python 依赖包 | `pip` 包不进仓库 | `pip install -r backend/requirements.txt` |
+| `frontend/node_modules/` | `npm` 包不进仓库 | `npm install --prefix frontend` |
+| `.env` | 含本机 Key 引用，绝不进 git | `Copy-Item .env.example .env`，再填 `AGNES_API_KEY`（见下节配置） |
+| `tools/opencode/opencode.exe`（约 180MB） | 按机配给；**缺失不影响出片**，仅开发期 Agent 用 | `.\tools\opencode\install.ps1`（锁定版本见 `tools/opencode/version.txt`） |
+| `outputs/<剧名>/` 历史成片 | 本地产物；后端运行时自动建目录 | 无需操作，跑一次渲染自动生成 |
+| `frontend/dist/` | 构建产物；`npm run dev` 不需要它 | 如需生产构建再跑 `npm run build --prefix frontend` |
+
+```powershell
+git clone https://github.com/shenxiu666/free-ai-video.git
+cd free-ai-video
+pip install -r backend/requirements.txt
+npm install --prefix frontend
+Copy-Item .env.example .env
+# 可选（缺失不影响出片）：.\tools\opencode\install.ps1
+```
+
 ## 快速开始
 
 双击仓库根的 `start.bat`（可右键发送到桌面快捷方式 / 固定到任务栏）：自动开后端（8000）+ 前端（5173）两个窗口并打开浏览器。窗口保持不闪退，出错直接看窗口里的报错。
