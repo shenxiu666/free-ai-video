@@ -17,7 +17,29 @@
 
     <div class="card controls">
       <label class="field">
-        <span>剧名</span>
+        <span>系列（GET /api/series，无后端降级本地索引）</span>
+        <select v-model="seriesSelect" @change="onSeriesChange">
+          <option value="">兼容模式：不选系列（用下方单剧名）</option>
+          <option v-for="s in queue.seriesList" :key="s.id" :value="s.id">{{ s.title }}</option>
+        </select>
+      </label>
+      <div v-if="queue.seriesEpisodes.length" class="ep-capsules" role="listbox" aria-label="集列表">
+        <button
+          v-for="ep in queue.seriesEpisodes"
+          :key="ep.id"
+          type="button"
+          role="option"
+          :aria-selected="queue.selectedEpId === ep.id"
+          class="ep-cap"
+          :class="{ active: queue.selectedEpId === ep.id }"
+          @click="onSelectEp(ep.id)"
+        >
+          <span class="ep-t">{{ ep.title }}</span>
+          <span class="ep-m">{{ queue.epProgress[ep.id] ?? 0 }}% · {{ queue.epStatus[ep.id] ?? '待排' }}{{ ep.planned_seconds != null ? ` · ${ep.planned_seconds}s` : '' }}</span>
+        </button>
+      </div>
+      <label class="field">
+        <span>剧名（兼容模式：老单剧名输入，系列模式下自动填集级 key）</span>
         <input v-model="dramaName" placeholder="如 demo" inputmode="text" @keyup.enter="onConnect" />
       </label>
       <div class="btn-row">
@@ -25,12 +47,18 @@
         <button type="button" class="btn accent" :disabled="!queue.connected" @click="onStart">
           开始渲染
         </button>
+        <button type="button" class="btn accent" :disabled="!queue.selectedEpId" @click="onRenderEp">
+          渲染本集
+        </button>
+        <button type="button" class="btn accent" :disabled="!queue.seriesEpisodes.length || queue.seriesRendering" @click="onRenderAll">
+          {{ queue.seriesRendering ? '整剧渲染中…' : '渲染整剧（按集串行）' }}
+        </button>
         <button type="button" class="btn" :disabled="!dramaName.trim() && !queue.name" @click="onResume">
           断点续跑
         </button>
         <button type="button" class="btn ghost" :disabled="!queue.connected" @click="onDisconnect">断开</button>
       </div>
-      <p class="hint">连接只看进度；“开始渲染”才真正开跑（图→视频→配音→合成，日志实时刷）。单镜失败点该镜“重试”只重跑该镜。</p>
+      <p class="hint">连接只看进度；“开始渲染”才真正开跑（图→视频→配音→合成，日志实时刷）。单镜失败点该镜“重试”只重跑该镜。系列模式：SSE 仍按当前集订阅，下方 clip 只看该集；系列聚合进度靠轮询汇总。</p>
     </div>
 
     <div class="card">
@@ -143,15 +171,73 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { useQueueStore, STAGES, type ClipState, type StageStatus } from '../stores/queue'
+import { episodeDramaKey } from '../api/series'
 
 const queue = useQueueStore()
+const route = useRoute()
 const dramaName = ref(queue.name || '')
+const seriesSelect = ref('')
 const paused = ref(false)
 const pressedId = ref<string | null>(null)
 const selectedId = ref<string | null>(null)
 const logBox = ref<HTMLDivElement | null>(null)
+
+onMounted(() => {
+  void queue.loadSeriesIndex().then(() => {
+    const qSeries = String(route.query.series ?? '')
+    const qEp = String(route.query.ep ?? '')
+    const qDrama = String(route.query.drama ?? '')
+    if (qSeries) {
+      seriesSelect.value = qSeries
+      void queue.selectSeriesForQueue(qSeries).then(() => {
+        if (qEp && queue.seriesEpisodes.some((e) => e.id === qEp)) void queue.selectEpisode(qEp)
+        else if (qDrama) {
+          dramaName.value = qDrama
+          void queue.connect(qDrama)
+        }
+        dramaName.value = queue.name || qDrama
+      })
+    } else if (qDrama) {
+      dramaName.value = qDrama
+      void queue.connect(qDrama)
+    }
+  })
+})
+
+/** 系列切换：集胶囊默认选中第一集并 connect（key 用 episode 级）。 */
+function onSeriesChange(): void {
+  if (!seriesSelect.value) {
+    queue.seriesId = ''
+    queue.seriesEpisodes = []
+    queue.selectedEpId = null
+    return
+  }
+  void queue.selectSeriesForQueue(seriesSelect.value).then(() => {
+    dramaName.value = queue.name
+  })
+}
+
+/** 集胶囊点击：切换 selectedEp，下方 clip/SSE 只看该集。 */
+function onSelectEp(epId: string): void {
+  void queue.selectEpisode(epId).then(() => {
+    dramaName.value = queue.name
+  })
+}
+
+/** 渲染本集：复用 startRender（集级 key）。 */
+function onRenderEp(): void {
+  const ep = queue.seriesEpisodes.find((e) => e.id === queue.selectedEpId)
+  if (ep) dramaName.value = episodeDramaKey(ep)
+  void queue.renderCurrentEpisode()
+}
+
+/** 渲染整剧（按集串行）。 */
+function onRenderAll(): void {
+  void queue.renderSeriesAll()
+}
 
 const selected = computed<ClipState | null>(
   () => queue.clipsState.find((c) => c.id === selectedId.value) ?? null
@@ -361,6 +447,57 @@ watch(
   border-radius: 10px;
   border: 1px solid var(--edge);
   background: rgba(255, 255, 255, 0.9);
+}
+
+.field select {
+  font: inherit;
+  color: var(--ink);
+  padding: 0.55rem 0.7rem;
+  border-radius: 10px;
+  border: 1px solid var(--edge);
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.ep-capsules {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  width: 100%;
+}
+
+.ep-cap {
+  font: inherit;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.15rem;
+  padding: 0.45rem 0.8rem;
+  border-radius: 999px;
+  border: 1px solid var(--edge);
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--ink);
+  cursor: pointer;
+  transition: transform 100ms ease, border-color 150ms ease;
+}
+
+.ep-cap:active {
+  transform: scale(0.97);
+}
+
+.ep-cap.active {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.2);
+}
+
+.ep-t {
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.ep-m {
+  font-size: 0.72rem;
+  color: var(--sub);
+  font-variant-numeric: tabular-nums;
 }
 
 .btn-row {
@@ -750,6 +887,7 @@ watch(
 }
 
 .queue input:focus-visible,
+.queue select:focus-visible,
 .queue .btn:focus-visible {
   outline: 2px solid #0a84ff;
   outline-offset: 2px;

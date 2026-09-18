@@ -55,13 +55,25 @@ def build_video_prompt(
     camera: str,
     lighting: str,
     style: str,
+    dialogue: str = "",
 ) -> str:
-    """六段式 video_prompt：[主体+动作+场景+运镜+光照+风格]。"""
+    """六段式 video_prompt：[主体+动作+场景+运镜+光照+风格]。
+
+    B路线：dialogue 非空时在[动作]段后追加
+    ``人物开口说中文“{dialogue}”，口型同步``（超120字截断防prompt爆炸）。
+    默认 "" 保持旧6参调用兼容；validate/build_payload 逻辑不动。
+    """
     parts = [subject, action, scene, camera, lighting, style]
     if any(not p or not str(p).strip() for p in parts):
         raise ValueError("video_prompt 六段式均不能为空")
+    dlg = str(dialogue or "").strip()
+    if len(dlg) > 120:
+        dlg = dlg[:120]
+    action_seg = f"[动作]{action}"
+    if dlg:
+        action_seg += f"人物开口说中文“{dlg}”，口型同步"
     return (
-        f"[主体]{subject}+[动作]{action}+[场景]{scene}"
+        f"[主体]{subject}+{action_seg}+[场景]{scene}"
         f"+[运镜]{camera}+[光照]{lighting}+[风格]{style}"
     )
 

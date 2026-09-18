@@ -17,6 +17,13 @@ export interface ScriptClip {
   start: number;
   duration: number;
   narration: string;
+  /** B 路线人物对白：只进 video_prompt，由视频模型原生发声；老剧缺字段当空 */
+  dialogue: string;
+  speaker?: string;
+  /** M3：参演角色名透传（可选 string[]），后端仅校验类型 */
+  cast?: string[];
+  /** 出场场景名透传（可选 string[]，与 cast 对齐，后端仅校验类型） */
+  scene?: string[];
   image_prompt: string;
   video_prompt: string;
   video_mode: VideoMode;
@@ -34,10 +41,22 @@ export interface DramaScript {
   total_seconds: number;
   aspect: Aspect;
   resolution: string;
+  /** "4"-"12" 或 "auto"（M3 放宽：auto 时逐镜时长各自 4-12） */
   clip_seconds: string;
   character_refs: string[];
+  /** 场景锚点（与 character_refs 平行，≤5），老剧缺字段当空 */
+  scene_refs: string[];
   clips: ScriptClip[];
   generated_by?: string;
+}
+
+/** AI 分镜缺图项（后端 find_missing_assets 透出，供分镜表“补传/AI生成”闭环） */
+export interface MissingAsset {
+  clip_id: string;
+  field: string;
+  kind: string;
+  name: string;
+  planned_path: string;
 }
 
 export interface ValidationResult {
@@ -56,8 +75,11 @@ export interface NewDramaResult extends RemoteResult {
 }
 
 export const VIDEO_MODES: VideoMode[] = ['text', 'keyframe', 'reference'];
-export const MIN_TOTAL_SECONDS = 60;
+// M3 契约放宽：语义为 total_seconds > 0（取消 60s 下限）；保留常量名兼容历史引用，
+// 值取 1（整数秒场景下等价于 >0）。<4s 仅警告“太短无法生成视频”，不阻断建剧/保存。
+export const MIN_TOTAL_SECONDS = 1;
 export const MAX_CHARACTER_REFS = 5;
+export const MAX_SCENE_REFS = 5;
 
 const LS_SCRIPT_PREFIX = 'free-ai-video:script:';
 const LS_STATE_PREFIX = 'free-ai-video:state:';
@@ -127,24 +149,33 @@ export function validateScript(script: DramaScript | null | undefined): Validati
   if (!script) {
     return { ok: false, errors: ['剧本为空：请先新建或加载'], warnings };
   }
-  // 01：标题 / 时长下限 60s / 画幅
+  // 01（M3 放宽）：标题 / 时长须 > 0（取消 60s 下限）/ 画幅
   if (!isNonEmptyString(script.title)) errors.push('剧名不能为空');
   if (!Number.isFinite(script.total_seconds) || script.total_seconds < MIN_TOTAL_SECONDS) {
-    errors.push(`总时长下限 ${MIN_TOTAL_SECONDS}s，当前 ${String(script.total_seconds)}`);
+    errors.push(`总时长须 > 0s（已放宽 60s 下限），当前 ${String(script.total_seconds)}`);
+  } else if (script.total_seconds < 4) {
+    warnings.push(`总时长仅 ${String(script.total_seconds)}s：太短无法生成视频（单镜视频至少 4s），仍可保存搭架子`);
   }
   if (script.aspect !== '9:16' && script.aspect !== '16:9') {
     errors.push(`画幅非法：${String(script.aspect)}（仅支持 9:16 / 16:9）`);
   }
-  // 04：clip_seconds 必须是 "4"-"12" 字符串语义
+  // 04（M3 放宽）：clip_seconds 为 "4"-"12" 字符串，或 "auto"（auto 时逐镜时长各自 4-12，见下）
+  const isAutoClip = script.clip_seconds === 'auto';
   const per = Number(script.clip_seconds);
-  if (!Number.isFinite(per) || !Number.isInteger(per) || per < 4 || per > 12) {
-    errors.push(`单镜时长非法：${String(script.clip_seconds)}（应为 "4"-"12"）`);
+  if (!isAutoClip && (!Number.isFinite(per) || !Number.isInteger(per) || per < 4 || per > 12)) {
+    errors.push(`单镜时长非法：${String(script.clip_seconds)}（应为 "4"-"12" 或 "auto"）`);
   }
-  // 04：character_refs ≤ 5
+  // 04：character_refs / scene_refs 各 ≤ 5
   if (!Array.isArray(script.character_refs)) {
     errors.push('角色锚点必须是数组');
   } else if (script.character_refs.length > MAX_CHARACTER_REFS) {
     errors.push(`角色锚点最多 ${MAX_CHARACTER_REFS} 张，当前 ${script.character_refs.length} 张`);
+  }
+  const sceneRefs = (script as DramaScript).scene_refs;
+  if (sceneRefs !== undefined && !Array.isArray(sceneRefs)) {
+    errors.push('场景锚点必须是数组');
+  } else if (Array.isArray(sceneRefs) && sceneRefs.length > MAX_SCENE_REFS) {
+    errors.push(`场景锚点最多 ${MAX_SCENE_REFS} 张，当前 ${sceneRefs.length} 张`);
   }
   if (!Array.isArray(script.clips) || script.clips.length === 0) {
     errors.push('分镜不能为空：至少需要 1 镜');
@@ -162,10 +193,33 @@ export function validateScript(script: DramaScript | null | undefined): Validati
     else if (seen.has(clip.id)) errors.push(`镜号重复：${clip.id}`);
     else seen.add(clip.id);
     if (!Number.isFinite(clip.duration) || clip.duration <= 0) errors.push(`${label}：时长必须 > 0`);
+    else if (isAutoClip && (Number(clip.duration) < 4 || Number(clip.duration) > 12)) {
+      errors.push(`${label}：auto 模式下单镜时长须在 4-12s 之间，当前 ${String(clip.duration)}s`);
+    }
     if (!Number.isFinite(clip.start) || clip.start < 0) errors.push(`${label}：开始秒非法`);
-    if (!isNonEmptyString(clip.narration)) warnings.push(`${label}：台词为空，配音将无台词`);
+    // B 路线：narration（TTS）与 dialogue（视频原生发声）至少其一非空，否则仅警告不阻断
+    // 注意：后端 validate_script 双空直接 400，保存/渲染前须补其一
+    const narrationText = typeof clip.narration === 'string' ? clip.narration.trim() : '';
+    const dialogueText = typeof (clip as ScriptClip).dialogue === 'string' ? ((clip as ScriptClip).dialogue as string).trim() : '';
+    if (!narrationText && !dialogueText) warnings.push(`${label}：旁白与对白均为空，保存时后端将拒绝（400），请先补其一`);
+    // B 路线 v1：一镜含旁白+对白渲染会失败（runner 要求拆镜），提前警告
+    if (narrationText && dialogueText) warnings.push(`${label}：一镜含旁白+对白，渲染将失败，请拆成两镜`);
+    // B 路线：超长对白提示拆镜（仅警告不阻断）
+    const dialogueLen = [...dialogueText].length;
+    if (dialogueLen > 45 || (dialogueLen > 30 && Number(clip.duration) <= 8)) {
+      warnings.push(`${label}：对白超长（${dialogueLen}字），建议拆镜`);
+    }
     if (!isNonEmptyString(clip.image_prompt)) warnings.push(`${label}：画面提示词为空`);
     if (!isNonEmptyString(clip.video_prompt)) warnings.push(`${label}：运镜提示词为空`);
+    // cast / scene 类型透传校验（与后端 validate_script 对齐，错了阻断保存）
+    const castRaw = (clip as ScriptClip).cast;
+    if (castRaw !== undefined && (!Array.isArray(castRaw) || castRaw.some((x) => typeof x !== 'string'))) {
+      errors.push(`${label}：参演角色 cast 须为字符串数组`);
+    }
+    const sceneRaw = (clip as ScriptClip).scene;
+    if (sceneRaw !== undefined && (!Array.isArray(sceneRaw) || sceneRaw.some((x) => typeof x !== 'string'))) {
+      errors.push(`${label}：出场场景 scene 须为字符串数组`);
+    }
     // 04 §4.4：video_mode 三态媒体字段规则
     const mode = clip.video_mode;
     if (mode !== 'text' && mode !== 'keyframe' && mode !== 'reference') {
@@ -227,7 +281,9 @@ export function validateScript(script: DramaScript | null | undefined): Validati
 
 export function buildDefaultScript(payload: NewDramaPayload): DramaScript {
   const total = Math.max(MIN_TOTAL_SECONDS, Math.floor(payload.total_seconds));
-  const per = Math.min(12, Math.max(4, Math.floor(Number(payload.clip_seconds) || 8)));
+  const rawClip = String(payload.clip_seconds ?? '8');
+  // "auto" 下按 8s 规划镜数，但保留 "auto" 原值透传后端（逐镜时长仍以各镜 duration 为准）
+  const per = rawClip === 'auto' ? 8 : Math.min(12, Math.max(4, Math.floor(Number(payload.clip_seconds) || 8)));
   const count = Math.ceil(total / per);
   const vertical = payload.aspect !== '16:9';
   const clips: ScriptClip[] = [];
@@ -241,11 +297,12 @@ export function buildDefaultScript(payload: NewDramaPayload): DramaScript {
       start: cursor,
       duration,
       narration: `第${i + 1}镜旁白（待改写）`,
+      dialogue: '',
       image_prompt: `[主体]待补充+[场景]待补充+[风格]${payload.style}+[光照]待补充+[构图]${vertical ? '竖构图' : '横构图'}+[质量]1K,高细节`,
       video_prompt: `[主体]待补充+[动作]待补充+[场景]待补充+[运镜]缓慢推镜+[光照]待补充+[风格]${payload.style}`,
-      // 首镜 text（无媒体字段即合法），后续 keyframe 链式衔接上一镜尾帧
+      // 首镜 text（无媒体字段即合法），后续 keyframe 链式衔接上一镜分镜图
       video_mode: i === 0 ? 'text' : 'keyframe',
-      ...(i === 0 ? {} : { first_frame: `shots/${prevId}_last.png` }),
+      ...(i === 0 ? {} : { first_frame: `images/${prevId}.png` }),
     });
     cursor += duration;
   }
@@ -254,8 +311,9 @@ export function buildDefaultScript(payload: NewDramaPayload): DramaScript {
     total_seconds: total,
     aspect: payload.aspect,
     resolution: vertical ? '720x1280' : '1280x720',
-    clip_seconds: String(per),
+    clip_seconds: rawClip === 'auto' ? 'auto' : String(per),
     character_refs: [],
+    scene_refs: [],
     clips,
     generated_by: `frontend-local ${new Date().toISOString()}`,
   };
@@ -270,7 +328,17 @@ function normalizeClip(raw: unknown, index: number): ScriptClip {
     id: isNonEmptyString(r['id']) ? (r['id'] as string) : `s${String(index + 1).padStart(2, '0')}`,
     start: Number(r['start']) || 0,
     duration: Number(r['duration']) || 0,
-    narration: asString(r['narration']),
+    narration: typeof r['narration'] === 'string' ? (r['narration'] as string).trim() : '',
+    dialogue: typeof r['dialogue'] === 'string' ? (r['dialogue'] as string).trim() : '',
+    ...(typeof r['speaker'] === 'string' ? { speaker: (r['speaker'] as string).trim() } : {}),
+    // M3：cast 透传（归一化前会丢未知字段，此处显式保留；类型问题由后端 validate_script 指出）
+    ...(Array.isArray(r['cast']) ? { cast: r['cast'] as string[] } : {}),
+    // 出场场景 scene 透传（string[]；单个字符串兼容为单元素）
+    ...(Array.isArray(r['scene'])
+      ? { scene: (r['scene'] as unknown[]).filter((x): x is string => typeof x === 'string') }
+      : typeof r['scene'] === 'string' && (r['scene'] as string).trim()
+        ? { scene: [(r['scene'] as string).trim()] }
+        : {}),
     image_prompt: asString(r['image_prompt']),
     video_prompt: asString(r['video_prompt']),
     video_mode: mode,
@@ -297,6 +365,9 @@ function normalizeScript(raw: unknown, fallback: DramaScript): DramaScript {
     character_refs: Array.isArray(r['character_refs'])
       ? (r['character_refs'] as unknown[]).filter(isNonEmptyString)
       : [],
+    scene_refs: Array.isArray(r['scene_refs'])
+      ? (r['scene_refs'] as unknown[]).filter(isNonEmptyString)
+      : [],
     clips: clipsRaw.length > 0 ? clipsRaw.map((c, i) => normalizeClip(c, i)) : fallback.clips,
     ...(typeof r['generated_by'] === 'string' ? { generated_by: r['generated_by'] as string } : {}),
   };
@@ -305,6 +376,18 @@ function normalizeScript(raw: unknown, fallback: DramaScript): DramaScript {
 function looksLikeScript(v: unknown): boolean {
   const r = asRecord(v);
   return !!r && Array.isArray(r['clips']);
+}
+
+/** 老草稿兼容：缺 narration/dialogue/speaker 读出为空字符串，不崩 */
+function ensureDialogueDefaults(script: DramaScript): DramaScript {
+  if (!script || !Array.isArray(script.clips)) return script;
+  for (const c of script.clips) {
+    const clip = c as ScriptClip;
+    if (typeof clip.narration !== 'string') clip.narration = '';
+    if (typeof clip.dialogue !== 'string') clip.dialogue = '';
+    if (typeof clip.speaker === 'string') clip.speaker = clip.speaker.trim();
+  }
+  return script;
 }
 
 function persistLocal(name: string, script: DramaScript, state: Record<string, unknown> | null): void {
@@ -373,6 +456,8 @@ export const useDramaStore = defineStore('drama', {
     script: null as DramaScript | null,
     stateJson: null as Record<string, unknown> | null,
     loading: false as boolean,
+    /** 最近一次 AI 分镜的缺图清单（补传/AI生成闭环用，不落盘） */
+    missingAssets: [] as MissingAsset[],
   }),
   getters: {
     clipSum(state): number {
@@ -392,12 +477,15 @@ export const useDramaStore = defineStore('drama', {
       this.loading = true;
       try {
         if (!payload.title.trim()) throw new Error('请填写剧名');
-        if (!Number.isFinite(payload.total_seconds) || payload.total_seconds < MIN_TOTAL_SECONDS) {
-          throw new Error(`总时长下限 ${MIN_TOTAL_SECONDS}s，当前 ${String(payload.total_seconds)}s`);
+        if (!Number.isFinite(payload.total_seconds) || payload.total_seconds <= 0) {
+          throw new Error(`总时长须 > 0s（已放宽 60s 下限），当前 ${String(payload.total_seconds)}s`);
         }
-        const per = Number(payload.clip_seconds);
-        if (!Number.isFinite(per) || per < 4 || per > 12) {
-          throw new Error('单镜时长需在 4-12s 之间');
+        const clipRaw = String(payload.clip_seconds ?? '');
+        if (clipRaw !== 'auto') {
+          const per = Number(payload.clip_seconds);
+          if (!Number.isFinite(per) || per < 4 || per > 12) {
+            throw new Error('单镜时长需在 4-12s 之间（或传 "auto" 按逐镜时长）');
+          }
         }
         const body: NewDramaPayload = {
           ...payload,
@@ -442,20 +530,26 @@ export const useDramaStore = defineStore('drama', {
         if (!payload.name.trim()) throw new Error('请填写剧名');
         if (!(payload.source_text || '').trim()) throw new Error('请粘贴小说/剧本原文后再分解');
         const res = await breakdownDrama({ ...payload, name: payload.name.trim() });
+        const resRec = (res.script && typeof res.script === 'object' ? res.script : {}) as Record<string, unknown>;
+        const resTotal = Number(resRec['total_seconds']);
         const fallback = buildDefaultScript({
           title: payload.name.trim(),
-          total_seconds: payload.total_seconds,
+          total_seconds: Number.isFinite(payload.total_seconds)
+            ? Number(payload.total_seconds)
+            : (Number.isFinite(resTotal) && resTotal > 0 ? resTotal : MIN_TOTAL_SECONDS),
           aspect: payload.aspect,
-          clip_seconds: payload.clip_seconds,
+          clip_seconds: payload.clip_seconds ?? 'auto',
           style: payload.style,
           brief: '',
         });
         const script = normalizeScript(looksLikeScript(res.script) ? res.script : null, fallback);
         this.script = script;
         this.stateJson = null;
+        this.missingAssets = Array.isArray(res.missing_assets) ? (res.missing_assets as MissingAsset[]) : [];
         persistLocal(script.title, script, null);
         const hint = res.truncated ? '（原文超长已截断前 12000 字）' : '';
-        return { script, remote: true, message: `AI 已分解出 ${script.clips.length} 镜${hint}，请到分镜表检查修改` };
+        const miss = this.missingAssets.length > 0 ? `，待补图 ${this.missingAssets.length} 处（分镜表内补传或 AI 生成）` : '';
+        return { script, remote: true, message: `AI 已分解出 ${script.clips.length} 镜${hint}${miss}，请到分镜表检查修改` };
       } finally {
         this.loading = false;
       }
@@ -484,7 +578,7 @@ export const useDramaStore = defineStore('drama', {
           // 后端有状态但无剧本：先看本地草稿，绝不用空架子覆盖
           const raw = lsGet(LS_SCRIPT_PREFIX + name);
           if (raw) {
-            this.script = JSON.parse(raw) as DramaScript;
+            this.script = ensureDialogueDefaults(JSON.parse(raw) as DramaScript);
             const st = lsGet(LS_STATE_PREFIX + name);
             this.stateJson = st ? (JSON.parse(st) as Record<string, unknown>) : asRecord(remoteRec?.['state']);
             await sleep(300);
@@ -496,7 +590,7 @@ export const useDramaStore = defineStore('drama', {
         } catch (e) {
           const raw = lsGet(LS_SCRIPT_PREFIX + name);
           if (!raw) throw e instanceof Error ? e : new Error(`加载失败且本地无缓存：${String(e)}`);
-          this.script = JSON.parse(raw) as DramaScript;
+          this.script = ensureDialogueDefaults(JSON.parse(raw) as DramaScript);
           const st = lsGet(LS_STATE_PREFIX + name);
           this.stateJson = st ? (JSON.parse(st) as Record<string, unknown>) : null;
           await sleep(300);
@@ -511,13 +605,15 @@ export const useDramaStore = defineStore('drama', {
       }
     },
 
-    /** 更新一镜：先 PUT 本地 store + 落盘，再 POST 后端；远端失败保留本地并回提示 */
+    /** 更新一镜：先 PUT 本地 store + 落盘，校验不通过则不同步后端（后端双空/时长和必 400）；再 POST 后端 */
     async saveClip(clipId: string, patch: Partial<ScriptClip>): Promise<RemoteResult> {
       if (!this.script) return { remote: false, message: '剧本为空，无法保存' };
       const clip = this.script.clips.find((c) => c.id === clipId);
       if (!clip) return { remote: false, message: `未找到分镜 ${clipId}` };
       Object.assign(clip, patch);
       persistLocal(this.script.title, this.script, this.stateJson);
+      const v = validateScript(this.script);
+      if (!v.ok) return { remote: false, message: `已存本地，校验未通过暂不同步：${v.errors[0]}（修完点“保存全部”重试）` };
       try {
         await saveDramaScript(this.script.title, this.script);
         return { remote: true, message: `${clipId} 已保存（本地 + 后端）` };
@@ -529,6 +625,8 @@ export const useDramaStore = defineStore('drama', {
     async saveAll(): Promise<RemoteResult> {
       if (!this.script) return { remote: false, message: '剧本为空，无法保存' };
       persistLocal(this.script.title, this.script, this.stateJson);
+      const v = validateScript(this.script);
+      if (!v.ok) return { remote: false, message: `已存本地，校验未通过暂不同步：${v.errors[0]}（修完再点“保存全部”）` };
       try {
         await saveDramaScript(this.script.title, this.script);
         return { remote: true, message: '已保存（本地 + 后端）' };
@@ -542,11 +640,13 @@ export const useDramaStore = defineStore('drama', {
       const per = Math.min(12, Math.max(4, Math.floor(Number(this.script.clip_seconds) || 8)));
       const clips = this.script.clips;
       const prev = clips[clips.length - 1];
+      // B 路线：新镜默认给旁白占位，避免双空直达后端 400；用户改填对白亦可
       const clip: ScriptClip = {
         id: nextClipId(clips),
         start: clips.reduce((acc, c) => acc + (Number(c.duration) || 0), 0),
         duration: per,
-        narration: '',
+        narration: `第${clips.length + 1}镜旁白（待改写）`,
+        dialogue: '',
         image_prompt: '',
         video_prompt: '',
         video_mode: prev ? 'keyframe' : 'text',
@@ -554,7 +654,7 @@ export const useDramaStore = defineStore('drama', {
           ? {
               first_frame: isNonEmptyString(prev.last_frame)
                 ? (prev.last_frame as string)
-                : `shots/${prev.id}_last.png`,
+                : `images/${prev.id}.png`,
             }
           : {}),
       };
@@ -584,6 +684,16 @@ export const useDramaStore = defineStore('drama', {
       if (!this.script) return;
       this.script.character_refs = refs;
       persistLocal(this.script.title, this.script, this.stateJson);
+    },
+
+    setSceneRefs(refs: string[]): void {
+      if (!this.script) return;
+      this.script.scene_refs = refs;
+      persistLocal(this.script.title, this.script, this.stateJson);
+    },
+
+    clearMissingAssets(): void {
+      this.missingAssets = [];
     },
   },
 });

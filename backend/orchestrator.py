@@ -1,10 +1,13 @@
 """短剧 Orchestrator：script.json 唯一真源 + state.json 状态机（docs/04.2/04.8）。
 
 校验（任一失败即阻断）：
-- total_seconds >= 60
-- clip_seconds 为字符串且 in "4".."12"
+- total_seconds > 0（M3 契约放宽：取消 60s 下限；<4s 仅前端警告，视频单镜仍至少 4s）
+- clip_seconds 为字符串且 in "4".."12"，或 "auto"（auto 时逐镜 duration 各自 4-12）
 - sum(clips.duration) == total_seconds
-- character_refs 长度 ≤ 5
+- character_refs / scene_refs 长度各 ≤ 5
+- 每镜可选 cast/scene: string[]（透传：须为字符串数组，否则阻断）
+- 生成模式媒体三态（只验形态，不验文件存在性）：
+  text 禁媒体 / keyframe 需首尾帧其一 / reference 需图音频其一（images≤5/audios≤3，禁 videos）
 
 状态：outputs/<剧名>/state.json，每镜 image/video/tts/mux:
 pending/doing/done/failed。断点续跑：产物存在 + state done 则跳过。
@@ -22,6 +25,8 @@ from typing import Any, Generator, Optional
 
 STAGES = ("image", "video", "tts", "mux")
 ALLOWED_CLIP_SECONDS = frozenset(str(i) for i in range(4, 13))
+#: M3 契约放宽：clip_seconds 允许 "auto"，此时逐镜 duration 各自须在 4-12s 内。
+CLIP_SECONDS_AUTO = "auto"
 
 # 视频提交全局串行锁：免费 1RPM 下禁止并行提速，超限退避 60s 由调用方处理。
 VIDEO_LOCK = threading.Lock()
@@ -52,15 +57,18 @@ def validate_script(script: dict) -> bool:
     total = script.get("total_seconds")
     if not isinstance(total, (int, float)) or isinstance(total, bool):
         raise ValueError("total_seconds 须为数字")
-    if float(total) < 60:
+    if float(total) <= 0:
         raise ValueError(
-            f"total_seconds 下限 60s，当前 {total!r}"
+            f"total_seconds 须 > 0（已放宽 60s 下限），当前 {total!r}"
         )
     clip_seconds = script.get("clip_seconds")
-    if not isinstance(clip_seconds, str) or clip_seconds not in ALLOWED_CLIP_SECONDS:
+    auto = isinstance(clip_seconds, str) and clip_seconds == CLIP_SECONDS_AUTO
+    if not auto and (
+        not isinstance(clip_seconds, str) or clip_seconds not in ALLOWED_CLIP_SECONDS
+    ):
         raise ValueError(
-            f"clip_seconds 须为字符串 {sorted(ALLOWED_CLIP_SECONDS)} 之一，"
-            f"当前 {clip_seconds!r}"
+            f"clip_seconds 须为字符串 {sorted(ALLOWED_CLIP_SECONDS)} 之一或 "
+            f"{CLIP_SECONDS_AUTO!r}，当前 {clip_seconds!r}"
         )
     refs = script.get("character_refs", [])
     if refs is None:
@@ -69,6 +77,14 @@ def validate_script(script: dict) -> bool:
         raise ValueError(
             f"character_refs 须为长度≤5 的列表，当前长度 "
             f"{len(refs) if isinstance(refs, list) else repr(refs)}"
+        )
+    srefs = script.get("scene_refs", [])
+    if srefs is None:
+        srefs = []
+    if not isinstance(srefs, list) or len(srefs) > 5:
+        raise ValueError(
+            f"scene_refs 须为长度≤5 的列表，当前长度 "
+            f"{len(srefs) if isinstance(srefs, list) else repr(srefs)}"
         )
     clips = script.get("clips")
     if not isinstance(clips, list) or not clips:
@@ -83,11 +99,101 @@ def validate_script(script: dict) -> bool:
         if not isinstance(d, (int, float)) or isinstance(d, bool) or float(d) <= 0:
             raise ValueError(f"clip {clip.get('id')!r} duration 须为正数")
         durations.append(float(d))
+        if auto and not 4 <= float(d) <= 12:
+            raise ValueError(
+                f"clip {clip.get('id')!r} duration 在 clip_seconds='auto' 下须"
+                f"各自 4-12s，当前 {d!r}"
+            )
         mode = clip.get("video_mode")
         if mode is not None and mode not in ("text", "keyframe", "reference"):
             raise ValueError(
                 f"clip {clip.get('id')!r} video_mode 非法: {mode!r}"
             )
+        # B 路线：旁白/对白/说话人均为 string（允许空/缺省），但旁白与对白至少其一非空
+        for _field in ("narration", "dialogue", "speaker"):
+            if _field in clip and not isinstance(clip[_field], str):
+                raise ValueError(
+                    f"clip {clip.get('id')!r} {_field} 须为字符串"
+                )
+        _narration = clip.get("narration", "")
+        _dialogue = clip.get("dialogue", "")
+        if not isinstance(_narration, str):
+            _narration = ""
+        if not isinstance(_dialogue, str):
+            _dialogue = ""
+        if not _narration.strip() and not _dialogue.strip():
+            raise ValueError(
+                f"clip {clip.get('id')!r} narration/dialogue 至少其一非空"
+            )
+        # M3：可选 cast 透传校验（缺省/None 不管；出现则须为 string[]）
+        _cast = clip.get("cast", None)
+        if _cast is not None:
+            if not isinstance(_cast, list) or any(
+                not isinstance(x, str) for x in _cast
+            ):
+                raise ValueError(
+                    f"clip {clip.get('id')!r} cast 须为 string[]，"
+                    f"当前 {_cast!r}"
+                )
+        # 场景：可选 scene 透传校验（缺省/None 不管；出现则须为 string[]）
+        _scene = clip.get("scene", None)
+        if _scene is not None:
+            if not isinstance(_scene, list) or any(
+                not isinstance(x, str) for x in _scene
+            ):
+                raise ValueError(
+                    f"clip {clip.get('id')!r} scene 须为 string[]，"
+                    f"当前 {_scene!r}"
+                )
+        # 生成模式媒体三态（只验形态合法，不验文件存在性；
+        # 缺文件由 runner 拿 Key 前验，初稿缺图走补齐闭环不阻断落盘）。
+        _mode = clip.get("video_mode", None) or "text"
+        _first = clip.get("first_frame", "")
+        _last = clip.get("last_frame", "")
+        _images = clip.get("images", [])
+        _audios = clip.get("audios", [])
+        _videos = clip.get("videos", [])
+        _has_first = isinstance(_first, str) and bool(_first.strip())
+        _has_last = isinstance(_last, str) and bool(_last.strip())
+        _nimgs = [x for x in _images if isinstance(x, str) and x.strip()] \
+            if isinstance(_images, list) else None
+        _naud = [x for x in _audios if isinstance(x, str) and x.strip()] \
+            if isinstance(_audios, list) else None
+        _nvid = [x for x in _videos if isinstance(x, str) and x.strip()] \
+            if isinstance(_videos, list) else None
+        if _images is not None and not isinstance(_images, list):
+            raise ValueError(f"clip {clip.get('id')!r} images 须为数组")
+        if _audios is not None and not isinstance(_audios, list):
+            raise ValueError(f"clip {clip.get('id')!r} audios 须为数组")
+        if _mode == "text":
+            if (_has_first or _has_last or (_nimgs or []) or (_naud or [])
+                    or (_nvid or [])):
+                raise ValueError(
+                    f"clip {clip.get('id')!r} text 模式禁止携带媒体字段")
+        elif _mode == "keyframe":
+            if not (_has_first or _has_last):
+                raise ValueError(
+                    f"clip {clip.get('id')!r} keyframe 模式需 "
+                    f"first_frame/last_frame 至少其一")
+            if (_nimgs or []) or (_naud or []):
+                raise ValueError(
+                    f"clip {clip.get('id')!r} keyframe 模式不需要 images/audios")
+        elif _mode == "reference":
+            if _nvid:
+                raise ValueError(
+                    f"clip {clip.get('id')!r} reference 模式禁止携带 videos")
+            if _nimgs is not None and len(_nimgs) > 5:
+                raise ValueError(
+                    f"clip {clip.get('id')!r} 参考图最多 5 张，"
+                    f"当前 {len(_nimgs)} 张")
+            if _naud is not None and len(_naud) > 3:
+                raise ValueError(
+                    f"clip {clip.get('id')!r} 参考音频最多 3 个，"
+                    f"当前 {len(_naud)} 个")
+            if not (_nimgs or []) and not (_naud or []):
+                raise ValueError(
+                    f"clip {clip.get('id')!r} reference 模式需 "
+                    f"images/audios 至少一类非空")
     if abs(sum(durations) - float(total)) > 1e-6:
         raise ValueError(
             f"sum(clips.duration)={sum(durations)} != total_seconds={total}"

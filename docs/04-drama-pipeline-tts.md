@@ -2,9 +2,9 @@
 
 ## 4.1 目标与输入约束
 
-本章定义60s+短剧的端到端流水线：`剧本→script.json→配音TTS→分镜图→分镜视频→合成输出`。
+本章定义短剧的端到端流水线：`剧本→script.json→配音TTS→分镜图→分镜视频→合成输出`。
 
-硬约束：短剧下限60s，用户自选60/90/120s/自定义时长；画幅默认9:16（720x1280），横屏16:9可选；视频单clip的`seconds`为字符串，取值4-12，推荐6-8镜×8-10s拼60s；镜数=总秒/单镜秒，向上取整，末镜不足则补足或截断对齐。
+硬约束：总时长须>0（单镜视频至少4s；60/90/120s仅为常用显式档，留空则由 AI 按原文量提议）；画幅默认9:16（720x1280），横屏16:9可选；视频单clip的`seconds`为字符串，取值4-12，按剧情节奏混剪（镜数≥3 时须含至少两种不同秒数，全等凑整 planner 校验不通过）；镜数由总时长与镜表决定，末镜收尾对齐总时长。
 
 ## 4.2 script.json契约
 
@@ -13,16 +13,16 @@
 ```json
 {
   "title": "重生之我在免费池修仙",
-  "total_seconds": 60,
+  "total_seconds": "<total须>0>",
   "aspect": "9:16",
   "resolution": "720x1280",
-  "clip_seconds": "8",
+  "clip_seconds": "<4-12或auto>",
   "character_refs": ["https://.../char1.png"],
   "clips": [
     {
       "id": "s01",
       "start": 0,
-      "duration": 8,
+      "duration": "<每镜4-12，和==total>",
       "narration": "三年前，他被逐出师门。",
       "srt_path": "tts/s01.srt",
       "image_prompt": "[主体]白衣少年山门前+[场景]雪夜石阶+[风格]电影感写实+[光照]冷月顶光+[构图]竖构图全身+[质量]1K,高细节",
@@ -34,7 +34,7 @@
 }
 ```
 
-校验规则：`total_seconds>=60`；`clip_seconds in ["4".."12"]`；`sum(clips.duration)==total_seconds`；`character_refs.length<=5`。
+校验规则：`total_seconds>0`；`clip_seconds in ["4".."12"]`或`"auto"`；`sum(clips.duration)==total_seconds`；`character_refs.length<=5`。
 
 ## 4.3 分镜时序估算
 
@@ -101,11 +101,13 @@
 
 分镜表不再手写：新建页粘贴小说/剧本原文 → `POST /api/drama/breakdown` → 文本模型按固定 prompt 输出严格 JSON → 服务端归一化并经 `validate_script` 校验 → 分镜表展示，用户逐镜修改后点“保存全部”落盘。`script.json` 仍为唯一真源，本接口只产初稿、不落盘。
 
-- 入参：`{name, total_seconds≥60, aspect, clip_seconds(4-12), style, source_text}`；原文超 12000 字截断前部并标注。
+- 入参：`{name, total_seconds>0, aspect, clip_seconds(4-12), style, source_text}`；原文超 12000 字截断前部并标注。
 - prompt（`backend/breakdown.py`）：把每镜时长表明写进题面要求逐镜照抄；`video_mode` 全 `"text"`（v1 只产合法初稿）；台词与六段式提示词必须出自原文。
 - 归一化保证：缺镜按计划补空镜、多镜截断；`start` 一律重算累加；末镜收敛使求和精确等于总时长；媒体字段丢弃。
 - HTTPS 通道：Agnes 用池 Key（自动排除自建专用密钥）、自建用端点专用密钥，各自取用归还（`release` 计一次文本调用，429/401 按 `error_map.yaml` 分类）；opencode-zen 走本地 CLI（免登录，不碰密钥池）。文本未配/原文为空 400，模型返回非法 JSON 或校验失败 502（可重试或改短原文）。
 - 前端：分解成功进分镜表（404 本地草稿提示与“连不上后端”区分）；离线保留“离线建空剧”搭架子。
+- 系列全链顺序：识别角色 → AI 规划 → AI 分镜（识别先行，为规划提供角色库真名锚点；规划失败即停）。
+- 人名口径（规划与识别同源）：`cast_plan.name` 须是本集原文逐字原形，库非空时只许用库名/别名（命中别名自动改本名），违例 502 重试；分镜落盘前 `cast[]` 再过一次库对齐，未命中保留原文写法并在 `note` 提示去角色页确认/合并。
 
 ## 4.11 渲染执行（worker 真跑，`backend/runner.py`）
 

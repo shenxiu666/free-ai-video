@@ -23,3 +23,5 @@ video:
 tts:
   provider: edge-tts
   voice: zh-CN-XiaoxiaoNeural
+  video_native_dialogue: true
+  dialogue_max_chars: 120

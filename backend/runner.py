@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 import shutil
 import threading
@@ -184,6 +185,368 @@ def build_err(exc: BaseException) -> dict:
     return {"status": 0, "body": str(exc)[:300], "retry_after": None}
 
 
+# ----- reference 参照图解析（docs/04.5：角色库 → 渲染） -----
+
+_REF_IMAGE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
+
+# 参照图 data URL mime 白名单（仅图片可透传下发；其余 data: 判不可用，
+# 在拿 Key 前即失败，不烧配额）。
+_DATA_IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
+
+# 单参照图文件上限 5MB：resolve 会把文件全量读入内存再 base64
+# （膨胀约 4/3，且 reference 最多 5 图并发在一镜里），无上限时大图/
+# 误配视频文件会吃光 worker 内存甚至 OOM。5MB 覆盖正常立绘
+# （通常几十~几百 KB），超限记单图不可用（failed），不整镜失败之外的
+# 连带影响，调用方在拿 Key 前即失败故不烧配额。
+REF_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+
+logger = logging.getLogger(__name__)
+
+_EP_SUFFIX_RE = re.compile(r"^(.*)\s(E\d+)$", re.IGNORECASE)
+
+
+def _is_remote_ref(s: str) -> bool:
+    t = str(s or "").strip().lower()
+    return t.startswith("http://") or t.startswith("https://")
+
+
+def _data_url_mime(s: str) -> str:
+    """取 data URL 的 mime（小写，无参）；非 data: 或解析失败返 ""。"""
+    t = str(s or "").strip()
+    if not t.lower().startswith("data:"):
+        return ""
+    head = t.split(",", 1)[0]  # "data:<mime>[;params]"（无逗号即畸形，仍尽力取 mime）
+    meta = head[5:].split(";")[0].strip().lower()
+    return meta
+
+
+def _is_data_url(s: str) -> bool:
+    """是否为可透传的图片 data URL：仅 mime 白名单内（png/jpeg/webp）。
+
+    非图片 data:（如 text/plain、application/json）返回 False，调用方须
+    将其判为 unusable（failed），在拿 Key 前失败，不烧配额。
+    """
+    return _data_url_mime(s) in _DATA_IMAGE_MIMES
+
+
+def _split_drama_name(name: str) -> tuple[str | None, str | None]:
+    """drama 名按 "<系列> E01" 约定拆出 (系列名, 集 id)，不符返 (None, None)。"""
+    try:
+        m = _EP_SUFFIX_RE.match(str(name or "").strip())
+        if not m:
+            return None, None
+        series_name = str(m.group(1) or "").strip()
+        ep_id = str(m.group(2) or "").strip().upper()
+        if not series_name or not ep_id:
+            return None, None
+        return series_name, ep_id
+    except Exception:
+        return None, None
+
+
+def _series_dir_for_drama(name: str, drama_dir: Path) -> Path | None:
+    """反推系列目录（best-effort：读 characters/x.png 相对路径用，失败返 None）。"""
+    try:
+        series_name, _ = _split_drama_name(name)
+        if not series_name:
+            return None
+        try:
+            import series as _se  # type: ignore
+        except ImportError:
+            try:
+                import backend.series as _se  # type: ignore
+            except ImportError:
+                return None
+        root = drama_dir.parent if isinstance(drama_dir, Path) else None
+        sdir = _se.series_dir(series_name,
+                              base_dir=str(root) if root is not None else None)
+        return sdir if sdir.is_dir() else None
+    except Exception:
+        return None
+
+
+def _load_library_for_drama(name: str, drama_dir: Path) -> list[dict]:
+    """best-effort 读系列角色库（供 cast→主图回退；失败返 []）。"""
+    try:
+        series_name, _ = _split_drama_name(name)
+        if not series_name:
+            return []
+        try:
+            import characters as _ch  # type: ignore
+        except ImportError:
+            try:
+                import backend.characters as _ch  # type: ignore
+            except ImportError:
+                return []
+        root = drama_dir.parent if isinstance(drama_dir, Path) else None
+        lib = _ch.load_characters(series_name,
+                                  base_dir=str(root) if root is not None else None)
+        return [c for c in (lib or []) if isinstance(c, dict)]
+    except Exception:
+        return []
+
+
+def _load_scene_library_for_drama(name: str, drama_dir: Path) -> list[dict]:
+    """best-effort 读系列场景库（供 scene→主图回退；失败返 []）。"""
+    try:
+        series_name, _ = _split_drama_name(name)
+        if not series_name:
+            return []
+        try:
+            import scenes as _sc  # type: ignore
+        except ImportError:
+            try:
+                import backend.scenes as _sc  # type: ignore
+            except ImportError:
+                return []
+        root = drama_dir.parent if isinstance(drama_dir, Path) else None
+        lib = _sc.load_scenes(series_name,
+                              base_dir=str(root) if root is not None else None)
+        return [c for c in (lib or []) if isinstance(c, dict)]
+    except Exception:
+        return []
+
+
+def _match_library_char(lib: list[dict], cast_name: str) -> dict | None:
+    """按名/别名归一匹配库角色（与 merge 的 char_keys 同规则的轻量实现）。"""
+    want = re.sub(r"\s+", "", str(cast_name or "").strip().lower())
+    if not want:
+        return None
+    for c in (lib or []):
+        if not isinstance(c, dict):
+            continue
+        keys: set[str] = set()
+        nm = re.sub(r"\s+", "", str(c.get("name", "") or "").strip().lower())
+        if nm:
+            keys.add(nm)
+        aliases = c.get("aliases", [])
+        if isinstance(aliases, list):
+            for a in aliases:
+                k = re.sub(r"\s+", "", str(a or "").strip().lower())
+                if k:
+                    keys.add(k)
+        if want in keys:
+            return c
+    return None
+
+
+def _match_scene(lib: list[dict], scene_name: str) -> dict | None:
+    """按名 strip 精确匹配库场景（大小写敏感，与 merge 规则一致）。"""
+    want = str(scene_name or "").strip()
+    if not want:
+        return None
+    for c in (lib or []):
+        if not isinstance(c, dict):
+            continue
+        if str(c.get("name", "") or "").strip() == want:
+            return c
+    return None
+
+
+def _clip_scene_names(clip: dict) -> list[str]:
+    """clip.scene 解析为名表（string 单值兼容为单元素；非标返 []）。"""
+    clip = clip if isinstance(clip, dict) else {}
+    sc = clip.get("scene", [])
+    if isinstance(sc, str):
+        sc = [sc]
+    if not isinstance(sc, list):
+        return []
+    out: list[str] = []
+    for x in sc:
+        s = str(x or "").strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def _canonical_frame_ref(s: str, drama_dir: Path) -> str:
+    """首尾帧引用归一：旧前端链式写法 shots/<id>_last.png 若对应
+    images/<id>.png 真实存在则改写为后者（runner 实际产物路径）；否则原样返回。
+    """
+    t = str(s or "").strip()
+    m = re.match(r"^shots/(s\d+)_last\.png$", t, re.IGNORECASE)
+    if not m:
+        return t
+    cand = drama_dir / "images" / f"{m.group(1).lower()}.png"
+    try:
+        if cand.is_file():
+            return f"images/{m.group(1).lower()}.png"
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return t
+
+
+def reference_images_for_clip(clip: dict, script: dict, drama_dir: Path,
+                               drama_name: str = "",
+                               characters: list[dict] | None = None,
+                               scenes: list[dict] | None = None) -> list[str]:
+    """reference 回退链（合并去重，≤5，未做可用性转换）。
+
+    clip.images（显式，AI 已填优先）+ cast 解析角色库主图 +
+    scene 解析场景库主图 + 全局 character_refs/scene_refs，
+    按此优先级合并去重后截断 5。
+    """
+    clip = clip if isinstance(clip, dict) else {}
+    script = script if isinstance(script, dict) else {}
+    merged: list[str] = []
+
+    def _push(s: str) -> None:
+        s = str(s or "").strip()
+        if s and s not in merged and len(merged) < 5:
+            merged.append(s)
+
+    for x in (clip.get("images") or []):
+        _push(str(x or ""))
+    if len(merged) < 5:
+        cast_names: list[str] = []
+        for x in (clip.get("cast") or []):
+            s = str(x or "").strip()
+            if s and s not in cast_names:
+                cast_names.append(s)
+        lib = list(characters) if characters is not None else _load_library_for_drama(
+            drama_name, drama_dir)
+        if cast_names and lib:
+            for nm in cast_names:
+                if len(merged) >= 5:
+                    break
+                hit = _match_library_char(lib, nm)
+                if not isinstance(hit, dict):
+                    continue
+                imgs = hit.get("images", [])
+                if isinstance(imgs, list):
+                    for im in imgs:
+                        s = str(im or "").strip()
+                        if s:
+                            _push(s)
+                            break
+    if len(merged) < 5:
+        scene_names = _clip_scene_names(clip)
+        slab = list(scenes) if scenes is not None else _load_scene_library_for_drama(
+            drama_name, drama_dir)
+        if scene_names and slab:
+            for nm in scene_names:
+                if len(merged) >= 5:
+                    break
+                hit = _match_scene(slab, nm)
+                if not isinstance(hit, dict):
+                    continue
+                imgs = hit.get("images", [])
+                if isinstance(imgs, list):
+                    for im in imgs:
+                        s = str(im or "").strip()
+                        if s:
+                            _push(s)
+                            break
+    if len(merged) < 5:
+        try:
+            raw_refs = list(script.get("character_refs", []) or []) + \
+                list(script.get("scene_refs", []) or [])
+        except Exception:
+            raw_refs = []
+        if isinstance(raw_refs, list):
+            for x in raw_refs:
+                if len(merged) >= 5:
+                    break
+                _push(str(x or ""))
+    return merged[:5]
+
+
+def resolve_reference_images(images: list[str], drama_dir: Path,
+                             series_dir: Path | None = None
+                             ) -> tuple[list[str], list[str]]:
+    """库内相对路径 → 可下发形态（本地文件转 data URL base64）。
+
+    远程 http(s)/图片 data URL 原样透传（非图片 data: 判 failed）；
+    本地按 [绝对路径/drama 目录/系列目录] 找文件，命中读字节转
+    ``data:<mime>;base64,``；找不到/不可读/超 REF_IMAGE_MAX_BYTES
+    （5MB，防全量读入内存 OOM）记 failed。返回 (usable, failed)。
+    """
+    usable: list[str] = []
+    failed: list[str] = []
+    bases: list[Path] = []
+    if isinstance(drama_dir, Path):
+        bases.append(drama_dir)
+    if isinstance(series_dir, Path):
+        bases.append(series_dir)
+    for raw in (images or []):
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        if _is_remote_ref(s):
+            if s not in usable:
+                usable.append(s)
+            continue
+        if s.lower().startswith("data:"):
+            if _is_data_url(s):
+                if s not in usable:
+                    usable.append(s)
+            else:
+                logger.warning("参照图 data URL 非图片类型已拒绝（mime=%r）：%s",
+                               _data_url_mime(s), s[:60])
+                if s not in failed:
+                    failed.append(s)
+            continue
+        mime = _REF_IMAGE_MIME.get(Path(s).suffix.lower(), "image/png")
+        cands: list[Path] = []
+        try:
+            p = Path(s)
+            if p.is_absolute():
+                cands.append(p)
+        except Exception:
+            pass
+        for b in bases:
+            try:
+                cands.append(b / s)
+            except Exception:
+                continue
+        hit: Path | None = None
+        for c in cands:
+            try:
+                if c.is_file():
+                    hit = c
+                    break
+            except (OSError, RuntimeError, ValueError):
+                continue
+        if hit is None:
+            if s not in failed:
+                failed.append(s)
+            continue
+        try:
+            if hit.stat().st_size > REF_IMAGE_MAX_BYTES:
+                logger.warning("参照图超限跳过（%s，%.1fMB>5MB，记单图不可用）：%s",
+                               hit.name, hit.stat().st_size / 1048576, s)
+                if s not in failed:
+                    failed.append(s)
+                continue
+        except OSError:
+            if s not in failed:
+                failed.append(s)
+            continue
+        try:
+            data = hit.read_bytes()
+        except OSError:
+            data = b""
+        if not data:
+            if s not in failed:
+                failed.append(s)
+            continue
+        if len(data) > REF_IMAGE_MAX_BYTES:
+            # stat 与读取间文件被改大（TOCTOU）：同样记单图不可用
+            logger.warning("参照图超限跳过（读入%.1fMB>5MB，记单图不可用）：%s",
+                           len(data) / 1048576, s)
+            if s not in failed:
+                failed.append(s)
+            continue
+        usable.append(f"data:{mime};base64,"
+                      f"{base64.b64encode(data).decode('ascii')}")
+    return usable, failed
+
+
 class _Worker:
     """单剧渲染 worker。ctx = {"pool", "image", "video", "tts"}（配置 dict）。"""
 
@@ -344,9 +707,15 @@ class _Worker:
         for clip in clips:
             cid = str(clip.get("id"))
             try:
+                # B路线 mixed 预检前移：旁白+对白同镜直接失败，不烧图片/视频配额
+                if self._is_mixed(clip):
+                    self._mark(cid, "tts", "failed")
+                    self._mark(cid, "video", "failed")
+                    raise RuntimeError(f"【{cid}】一镜含旁白+对白，v1 请拆成两镜后再渲染")
                 self._run_image(clip, image_cfg)
-                self._run_video(clip, clips, video_cfg)
+                # B路线：TTS判定先行（原生写占位srt）
                 self._run_tts(clip, tts_cfg)
+                self._run_video(clip, clips, video_cfg)
                 self._run_clip_mux(clip)
             except Exception as exc:  # noqa: BLE001 — 单镜失败记 failed 继续
                 self.log(f"【{cid}】失败：{exc}（已记 failed，可单独重试）")
@@ -406,11 +775,83 @@ class _Worker:
             dur = 8.0
         return str(min(12, max(4, round(dur))))
 
+    @staticmethod
+    def _clip_dialogue(clip: dict) -> str:
+        """B路线对白：缺字段老剧按空处理。"""
+        try:
+            return str(clip.get("dialogue") or "").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _clip_narration(clip: dict) -> str:
+        try:
+            return str(clip.get("narration") or "").strip()
+        except Exception:
+            return ""
+
+    @classmethod
+    def _is_native_dialogue(cls, clip: dict) -> bool:
+        """纯对白镜：dialogue非空且narration为空（TTS跳过，视频原生发声）。"""
+        return bool(cls._clip_dialogue(clip)) and not cls._clip_narration(clip)
+
+    @classmethod
+    def _is_mixed(cls, clip: dict) -> bool:
+        """mixed镜：旁白+对白都非空，v1不支持，需拆镜。"""
+        return bool(cls._clip_dialogue(clip)) and bool(cls._clip_narration(clip))
+
+    @staticmethod
+    def _srt_ts(seconds: float) -> str:
+        """秒 → SRT时间戳 HH:MM:SS,mmm。"""
+        try:
+            total_ms = max(0, int(round(float(seconds) * 1000)))
+        except (TypeError, ValueError):
+            total_ms = 0
+        hh, rem = divmod(total_ms, 3600000)
+        mm, rem = divmod(rem, 60000)
+        ss, ms = divmod(rem, 1000)
+        return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+    @classmethod
+    def _clip_duration_s(cls, clip: dict, default: float = 8.0) -> float:
+        try:
+            d = float(clip.get("duration", default) or default)
+        except (TypeError, ValueError):
+            d = float(default)
+        return d if d > 0 else float(default)
+
+    @classmethod
+    def _final_video_prompt(cls, clip: dict) -> str:
+        """B路线prompt组装：base video_prompt + 对白后缀（老剧缺dialogue按空）。
+
+        后缀与 providers.agnes_video.build_video_prompt dialogue逻辑保持一致：
+        ``人物开口说中文“{dialogue}”，口型同步``，超120字截断。
+        """
+        try:
+            base = str(clip.get("video_prompt") or "")
+        except Exception:
+            base = ""
+        dlg = cls._clip_dialogue(clip)
+        if not dlg:
+            return base
+        if len(dlg) > 120:
+            dlg = dlg[:120]
+        suffix = f"人物开口说中文“{dlg}”，口型同步"
+        if not base.strip():
+            return suffix
+        return f"{base}{suffix}"
+
     def _run_video(self, clip: dict, all_clips: list[dict], cfg: dict) -> None:
         cid = str(clip.get("id"))
         dest = self.ddir / "videos" / f"{cid}.mp4"
         if not self._need(cid, "video", dest):
             return
+        # B路线兜底：mixed镜直接失败，不拿Key不烧视频配额（正常流已由先行TTS判定拦截）
+        if self._is_mixed(clip):
+            self._mark(cid, "tts", "failed")
+            self._mark(cid, "video", "failed")
+            raise RuntimeError(
+                f"【{cid}】一镜含旁白+对白，请拆镜（v1单镜仅支持旁白或对白其一；未烧视频配额）")
         if _submit_video is None or _poll_video is None:
             self._mark(cid, "video", "failed")
             raise RuntimeError("视频 Provider 缺失")
@@ -423,14 +864,36 @@ class _Worker:
             prev_img = self._prev_image(clip, all_clips)
             first_frame = (str(clip.get("first_frame") or "").strip()
                            or (str(prev_img) if prev_img else ""))
+            if first_frame:
+                # 旧前端链式写法 shots/<id>_last.png → 实际产物 images/<id>.png
+                try:
+                    first_frame = _canonical_frame_ref(first_frame, self.ddir)
+                except Exception:
+                    pass
             if not first_frame:
                 self._mark(cid, "video", "failed")
                 raise RuntimeError("首尾帧模式缺首帧（无 first_frame 且无上一镜成图），请补帧后重试")
         elif mode == "reference":
-            images = [str(x) for x in (clip.get("images") or [])][:5]
-            if not images:
-                images = [str(x) for x in (self.script.get("character_refs") or [])][:5]
+            # 回退链 clip.images → cast 库主图 → character_refs；先转可用形态，
+            # 先校验再拿 Key：转换失败/两空直接 failed，不烧配额。
+            cands = reference_images_for_clip(
+                clip, self.script, self.ddir, drama_name=self.name)
+            usable, failed = resolve_reference_images(
+                cands, self.ddir,
+                series_dir=_series_dir_for_drama(self.name, self.ddir))
+            if failed:
+                self._mark(cid, "video", "failed")
+                raise RuntimeError(
+                    f"角色参照图不可用（{','.join(failed[:3])}"
+                    f"{'…' if len(failed) > 3 else ''}）："
+                    f"请补立绘后重试（未拿 Key，未烧配额）")
+            images = list(usable)
             audios = [str(x) for x in (clip.get("audios") or [])][:3]
+            if not images and not audios:
+                self._mark(cid, "video", "failed")
+                raise RuntimeError(
+                    "reference 模式需 images/audios 至少一类非空"
+                    "（角色库无可用主图）：请补立绘后重试（未拿 Key，未烧配额）")
         # 先拿到 Key 再标 doing：拿不到直接 failed，状态不说谎
         try:
             entry = self._acquire_video()
@@ -448,9 +911,12 @@ class _Worker:
         start = time.perf_counter()
         video_id = ""
         try:
+            # B路线：clip含dialogue则进video_prompt（老剧缺字段按空），audios保持留空不回喂wav
+            video_prompt = self._final_video_prompt(clip)
             video_id, entry, key = self._submit_with_retry(
                 cid, clip, seconds, key, mode,
-                first_frame, images, audios, entry, start)
+                first_frame, images, audios, entry, start,
+                prompt=video_prompt)
             self.log(f"【{cid}】任务已提交（id={video_id}），轮询等成片…")
             result = _poll_video(
                 video_id, key, timeout_total=1800, interval=3.0,
@@ -474,18 +940,22 @@ class _Worker:
     def _submit_with_retry(self, cid: str, clip: dict, seconds: str, key: str,
                            mode: str, first_frame: str | None,
                            images: list[str], audios: list[str],
-                           entry: Any, start: float) -> tuple[str, Any, str]:
+                           entry: Any, start: float,
+                           prompt: str | None = None) -> tuple[str, Any, str]:
         """提交最多 VIDEO_SUBMIT_ATTEMPTS 次：429/超时退避重提，其余直接失败。
 
         返回 (video_id, 当前持有 entry, 当前 key)：重提换 Key 后调用方继续用
         新 entry 轮询与归还，不泄漏。每次失败都先归还旧 Key 再睡后重取。
+        prompt 为空则按clip组装（含dialogue后缀，老剧兼容）；显式传入优先。
         """
         last_exc: Exception | None = None
         for attempt in range(1, VIDEO_SUBMIT_ATTEMPTS + 1):
             try:
                 with _video_slot():
+                    final_prompt = (prompt if prompt is not None
+                                    else self._final_video_prompt(clip))
                     video_id = _submit_video(
-                        str(clip.get("video_prompt", "") or ""),
+                        final_prompt,
                         seconds, key, mode=mode,
                         first_frame=first_frame,
                         images=images or None,
@@ -540,9 +1010,29 @@ class _Worker:
         if not self._need(cid, "tts", wav):
             return
         if _synthesize is None:
+            # B路线原生镜也不需TTS模块：先判定，避免缺模块误杀原生镜
+            if self._is_native_dialogue(clip):
+                pass
+            else:
+                self._mark(cid, "tts", "failed")
+                raise RuntimeError("TTS 模块缺失")
+        text = self._clip_narration(clip)
+        dialogue = self._clip_dialogue(clip)
+        if text and dialogue:
+            # mixed镜v1抛错提示拆镜：记failed，不调视频（调用方保证先TTS判定再视频）
             self._mark(cid, "tts", "failed")
-            raise RuntimeError("TTS 模块缺失")
-        text = str(clip.get("narration", "") or "").strip()
+            raise RuntimeError(
+                f"【{cid}】一镜含旁白+对白，请拆镜（v1单镜仅支持旁白或对白其一；未烧视频配额）")
+        if dialogue and not text:
+            # B路线纯对白：跳过synthesize，写跨整镜时长占位srt供字幕用
+            dur = self._clip_duration_s(clip)
+            srt.parent.mkdir(parents=True, exist_ok=True)
+            srt.write_text(
+                f"1\n{self._srt_ts(0)} --> {self._srt_ts(dur)}\n{dialogue}\n",
+                encoding="utf-8")
+            self.log(f"【{cid}】原生发声跳过：对白由视频直出，不调TTS（字幕占位已写）")
+            self._mark(cid, "tts", "done")
+            return
         if not text:
             srt.parent.mkdir(parents=True, exist_ok=True)
             srt.write_text("1\n00:00:00,000 --> 00:00:01,000\n…\n", encoding="utf-8")
@@ -602,7 +1092,11 @@ class _Worker:
             wav_ok = wav.is_file() and wav.stat().st_size > 0
         except OSError:
             wav_ok = False
-        if not wav_ok:
+        # B路线：对白原生镜dub置空（不混TTS，即使有残留wav也不盖）
+        is_native = self._is_native_dialogue(clip)
+        if is_native:
+            wav_ok = False
+        if not wav_ok and not is_native:
             self.log(f"【{cid}】缺配音，单镜成品将无旁白（仍出片）")
         if not srt_ok:
             self.log(f"【{cid}】缺字幕，单镜成品将无字幕（仍出片）")
@@ -680,9 +1174,11 @@ class _Worker:
         srt_all = self._build_full_srt(clips, ready)
         # 配音混入：有 wav（存在且非空）的镜按剧本 start 对齐；
         # 缺 wav / 缺 srt 必须点名留痕（warn+顶层 mux_detail），不静默跳过。
+        # B路线：对白原生镜dub置空（不混TTS，不计missing_dubs，另记native_dialogue）。
         dub_tracks: list[tuple[str, float]] = []
         missing_dubs: list[str] = []
         missing_srts: list[str] = []
+        native_dialogue: list[str] = []
         for clip in clips:
             cid = str(clip.get("id"))
             if cid not in ready:
@@ -694,6 +1190,9 @@ class _Worker:
                 srt_ok = False
             if not srt_ok:
                 missing_srts.append(cid)
+            if self._is_native_dialogue(clip):
+                native_dialogue.append(cid)
+                continue
             wav = self.ddir / "audio" / f"{cid}.wav"
             try:
                 wav_ok = wav.is_file() and wav.stat().st_size > 0
@@ -711,7 +1210,8 @@ class _Worker:
         dub_total = len(ready)
         self._record_mux_detail({"missing_dubs": missing_dubs,
                                  "missing_srts": missing_srts,
-                                 "dub_ok": dub_ok, "dub_total": dub_total})
+                                 "dub_ok": dub_ok, "dub_total": dub_total,
+                                 "native_dialogue": native_dialogue})
         # 版本化成片：每次合成独立文件存成片/文件夹保留，
         # final.mp4 恒为最新版指针（兼容旧习惯）
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -797,7 +1297,7 @@ class _Worker:
     def _record_mux_detail(self, detail: dict) -> None:
         """配音/字幕缺轨留痕：state.json 顶层 mux_detail（前端读顶层）。
 
-        detail = {missing_dubs, missing_srts, dub_ok, dub_total}。
+        detail = {missing_dubs, missing_srts, dub_ok, dub_total, native_dialogue}。
         """
         try:
             sp = self.ddir / "state.json"
@@ -809,19 +1309,40 @@ class _Worker:
                 "missing_srts": list(detail.get("missing_srts", []) or []),
                 "dub_ok": int(detail.get("dub_ok", 0) or 0),
                 "dub_total": int(detail.get("dub_total", 0) or 0),
+                "native_dialogue": list(detail.get("native_dialogue", []) or []),
             }
             sp.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
         except (OSError, ValueError):
             pass
 
     def _build_full_srt(self, clips: list[dict], ready: list[str]) -> Path | None:
-        """各镜 srt 按开始秒偏移拼接（缺台词的镜跳过）。"""
+        """各镜 srt 按开始秒偏移拼接（缺台词的镜跳过）。
+
+        B路线：对白原生镜字幕块跨整镜（start→start+duration显示dialogue全文），
+        不读占位srt文件，直接按剧本生成。
+        """
         out = self.ddir / "full.srt"
         blocks: list[str] = []
         index = 1
         for clip in clips:
             cid = str(clip.get("id"))
             if cid not in ready:
+                continue
+            # B路线原生镜：整镜时长一块字幕
+            if self._is_native_dialogue(clip):
+                try:
+                    start_s = float(clip.get("start", 0) or 0)
+                except (TypeError, ValueError):
+                    start_s = 0.0
+                dur = self._clip_duration_s(clip)
+                end_s = start_s + dur
+                dlg = self._clip_dialogue(clip)
+                if not dlg:
+                    continue
+                blocks.append(f"{index}")
+                blocks.append(f"{self._srt_ts(start_s)} --> {self._srt_ts(end_s)}")
+                blocks.append(dlg)
+                index += 1
                 continue
             srt = self.ddir / "audio" / f"{cid}.srt"
             if not srt.is_file():

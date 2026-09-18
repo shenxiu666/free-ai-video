@@ -77,6 +77,9 @@ def build_mux_filter(
     配音（dubs=[(输入序号, 延迟毫秒)]）经 adelay 对齐后 apad 保 bleed，
     再与原音频 amix(duration=longest 不截超长配音尾)，最后统一 loudnorm。
     无 dubs 时音频直走 loudnorm，与旧形状一致。
+    B路线用法：对白镜保留视频原生音频不盖TTS——调用方对该镜不传dub
+    （dubs=None/[]，或dub_tracks缺wav自动跳过），即走无dubs分支保留原音；
+    仅旁白镜传dub混入。此处不改行为，仅明确约定。
     audio_present：各视频输入是否有音频流（None=全 True 兼容旧单测）；
     缺音频的路用 anullsrc 补静音，保证 [a{i}] 可参与 concat/acrossfade/amix。
     """
@@ -201,6 +204,8 @@ def build_mux_command(
     dub_tracks=[(wav 路径, 开始秒)]：存在的 wav 追加为输入，按开始秒 adelay
     对齐后 apad 保 bleed 再与原音频 amix(longest)；缺文件的镜自动跳过
     （仅 is_file 判断，runner 已做 size>0 过滤）；全缺则走无混音旧形状。
+    B路线用法：对白原生镜由调用方传空dub（dub_tracks=None/[]，或该镜无wav
+    即自动跳过）以保留原音，此处不改行为；仅旁白镜传入对应wav。
     字幕链到视频输出 label 上（勿缀音频链，否则绑 pad 失败）。
     缺音频的视频输入用定长 anullsrc 补静音（时长取 ffprobe 实测；
     audio_present 显式传入时优先使用，默认自动探测；无音频又探不到时长直接抛错）。

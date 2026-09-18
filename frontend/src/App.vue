@@ -3,7 +3,8 @@
     <GlassBar position="top">
       <span class="display app-title">free-ai-video</span>
       <nav class="app-nav" aria-label="主导航">
-        <RouterLink to="/new" class="nav-link button">新建</RouterLink>
+        <RouterLink to="/series/new" class="nav-link button">新建系列</RouterLink>
+        <RouterLink to="/new" class="nav-link button">单集</RouterLink>
         <RouterLink to="/shots" class="nav-link button">分镜</RouterLink>
         <RouterLink to="/queue" class="nav-link button">队列</RouterLink>
         <RouterLink to="/keys" class="nav-link button">Keys</RouterLink>

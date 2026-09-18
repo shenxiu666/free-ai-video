@@ -6,15 +6,18 @@ import {
   startRenderRequest,
   fetchRenderStatus,
   openQueueStream,
+  fetchSeriesIndex,
   QueueHttpError,
   type ClipStateDTO,
   type DramaStateDTO,
   type FinalEntryDTO,
   type MuxDetailDTO,
   type QueueEventDTO,
+  type SeriesOptionDTO,
   type StageName,
   type StageStatus
 } from '../api/queue'
+import { listEpisodes, episodeDramaKey, type EpisodeSummary } from '../api/series'
 
 export type { StageName, StageStatus }
 
@@ -415,5 +418,195 @@ export const useQueueStore = defineStore('queue', () => {
     }
   }
 
-  return { name, clipsState, logs, connected, lastRefresh, rendering, finalInfo, connect, disconnect, resume, retryClip, startRender, refreshState, clearLogs }
+  /* ---------------- M2 系列模式（集胶囊 + 按集串行） ---------------- */
+  /** 系列下拉数据源；无后端时降级本地索引（series store 落盘的 localStorage）。 */
+  const seriesList = ref<SeriesOptionDTO[]>([])
+  const seriesId = ref('')
+  const seriesEpisodes = ref<EpisodeSummary[]>([])
+  /** 当前选中的集 id；下方 clip/SSE 只看该集（connect 用集级 dramaKey）。 */
+  const selectedEpId = ref<string | null>(null)
+  /** 系列聚合进度（靠轮询逐集 fetchDramaState 汇总，key=episode id）。 */
+  const epProgress = ref<Record<string, number>>({})
+  const epStatus = ref<Record<string, string>>({})
+  const seriesLoading = ref(false)
+  /** 整剧串行渲染是否进行中（防重入）。 */
+  const seriesRendering = ref(false)
+
+  const LS_SERIES_INDEX = 'free-ai-video:series:index'
+  const LS_EPS_PREFIX = 'free-ai-video:episodes:'
+
+  function readLocalIndex(): SeriesOptionDTO[] {
+    try {
+      const raw = localStorage.getItem(LS_SERIES_INDEX)
+      if (!raw) return []
+      const arr = JSON.parse(raw) as Array<Record<string, unknown>>
+      if (!Array.isArray(arr)) return []
+      return arr
+        .filter((x) => x && typeof x === 'object')
+        .map((r) => ({ id: String(r['id'] ?? ''), title: String(r['title'] ?? r['id'] ?? '') }))
+        .filter((s) => !!s.id)
+    } catch {
+      return []
+    }
+  }
+
+  function readLocalEpisodes(sid: string): EpisodeSummary[] {
+    try {
+      const raw = localStorage.getItem(LS_EPS_PREFIX + sid)
+      if (!raw) return []
+      const arr = JSON.parse(raw) as unknown
+      if (!Array.isArray(arr)) return []
+      return (arr as EpisodeSummary[]).filter((e) => e && typeof e.id === 'string')
+    } catch {
+      return []
+    }
+  }
+
+  /** 顶部剧下拉：GET /api/series，无后端降级本地索引。 */
+  async function loadSeriesIndex(): Promise<void> {
+    seriesLoading.value = true
+    try {
+      seriesList.value = await fetchSeriesIndex()
+      if (seriesList.value.length) {
+        try {
+          localStorage.setItem(LS_SERIES_INDEX, JSON.stringify(seriesList.value))
+        } catch {
+          /* 忽略 */
+        }
+      }
+    } catch {
+      seriesList.value = readLocalIndex()
+      pushLog('warn', '系列下拉后端不可达，已降级本地索引')
+    } finally {
+      seriesLoading.value = false
+    }
+  }
+
+  /** 选中系列：拉集列表（远端优先，离线读本地），默认选中第一集并 connect（集级 key）。 */
+  async function selectSeriesForQueue(sid: string): Promise<void> {
+    seriesId.value = sid
+    selectedEpId.value = null
+    epProgress.value = {}
+    epStatus.value = {}
+    if (!sid) {
+      seriesEpisodes.value = []
+      return
+    }
+    try {
+      seriesEpisodes.value = await listEpisodes(sid)
+    } catch {
+      seriesEpisodes.value = readLocalEpisodes(sid)
+      pushLog('warn', '集列表后端不可达，已降级本地索引')
+    }
+    if (seriesEpisodes.value.length) {
+      await selectEpisode(seriesEpisodes.value[0].id)
+      void pollSeriesProgress()
+    }
+  }
+
+  /** 点击集胶囊：切换 selectedEp，下方 clip/SSE 只看该集（复用 connect，key 用 episode 级）。 */
+  async function selectEpisode(epId: string): Promise<void> {
+    const ep = seriesEpisodes.value.find((e) => e.id === epId)
+    if (!ep) return
+    selectedEpId.value = epId
+    await connect(episodeDramaKey(ep))
+  }
+
+  function selectedEpisode(): EpisodeSummary | null {
+    return seriesEpisodes.value.find((e) => e.id === selectedEpId.value) ?? null
+  }
+
+  /** 系列聚合靠轮询：逐集 fetchDramaState 算进度%/状态（SSE 仍按当前集订阅）。 */
+  async function pollSeriesProgress(): Promise<void> {
+    for (const ep of seriesEpisodes.value) {
+      const key = episodeDramaKey(ep)
+      if (!key) continue
+      try {
+        const dto = await fetchDramaState(key)
+        const total = dto.clips.length || 1
+        const done = dto.clips.filter((c) => c.image === 'done' && c.video === 'done' && c.tts === 'done' && c.mux === 'done').length
+        const failed = dto.clips.some((c) => c.image === 'failed' || c.video === 'failed' || c.tts === 'failed' || c.mux === 'failed')
+        epProgress.value = { ...epProgress.value, [ep.id]: Math.round((done / total) * 100) }
+        epStatus.value = {
+          ...epStatus.value,
+          [ep.id]: failed ? '失败' : done === total ? '完成' : dto.clips.length ? '进行中' : '待排'
+        }
+        if (typeof dto.total_seconds === 'number') {
+          const i = seriesEpisodes.value.findIndex((x) => x.id === ep.id)
+          if (i >= 0 && seriesEpisodes.value[i].planned_seconds == null) {
+            seriesEpisodes.value[i] = { ...seriesEpisodes.value[i], planned_seconds: dto.total_seconds }
+          }
+        }
+      } catch {
+        /* 单集轮询失败不污染其他集 */
+      }
+    }
+  }
+
+  /** 渲染本集：复用 startRender（当前 selectedEp 的集级 key）。 */
+  async function renderCurrentEpisode(): Promise<void> {
+    const ep = selectedEpisode()
+    if (!ep) {
+      pushLog('warn', '请先在上方选择一集')
+      return
+    }
+    await connect(episodeDramaKey(ep))
+    await startRender()
+  }
+
+  /** 渲染整剧（按集串行）：逐集 connect→start→轮询到终态再下一集。 */
+  async function renderSeriesAll(): Promise<void> {
+    if (seriesRendering.value) {
+      pushLog('warn', '整剧渲染进行中，请等待完成')
+      return
+    }
+    if (!seriesEpisodes.value.length) {
+      pushLog('warn', '该系列暂无集可渲染')
+      return
+    }
+    seriesRendering.value = true
+    pushLog('info', `整剧串行渲染开始：共 ${seriesEpisodes.value.length} 集`)
+    try {
+      for (const ep of seriesEpisodes.value) {
+        const key = episodeDramaKey(ep)
+        pushLog('info', `—— 本集开跑：${ep.title}（key=${key}）`)
+        await connect(key)
+        selectedEpId.value = ep.id
+        try {
+          await startRenderRequest(key)
+          rendering.value = true
+        } catch (e) {
+          pushLog('error', `本集提交失败 ${ep.title}：${e instanceof Error ? e.message : String(e)}`)
+          continue
+        }
+        // 等本集终态：每 5s 查一次，最多等 30min；失败镜不阻塞下一集
+        for (let i = 0; i < 360; i++) {
+          await new Promise((r) => setTimeout(r, 5000))
+          try {
+            const dto = await fetchDramaState(key)
+            applyState(dto)
+            const pending = dto.clips.some((c) =>
+              c.image !== 'done' && c.image !== 'failed' ||
+              c.video !== 'done' && c.video !== 'failed' ||
+              c.tts !== 'done' && c.tts !== 'failed' ||
+              c.mux !== 'done' && c.mux !== 'failed'
+            )
+            const stillRunning = await fetchRenderStatus(key)
+            if (!pending && !stillRunning) break
+          } catch {
+            /* 轮询抖动继续等 */
+          }
+        }
+        pushLog('info', `—— 本集结束：${ep.title}，进入下一集`)
+        await pollSeriesProgress()
+      }
+      pushLog('info', '整剧串行渲染完成')
+    } finally {
+      seriesRendering.value = false
+    }
+  }
+
+  return { name, clipsState, logs, connected, lastRefresh, rendering, finalInfo, connect, disconnect, resume, retryClip, startRender, refreshState, clearLogs,
+    seriesList, seriesId, seriesEpisodes, selectedEpId, epProgress, epStatus, seriesLoading, seriesRendering,
+    loadSeriesIndex, selectSeriesForQueue, selectEpisode, pollSeriesProgress, renderCurrentEpisode, renderSeriesAll }
 })

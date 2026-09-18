@@ -112,11 +112,23 @@ export function fetchModels(): Promise<unknown> {
 
 export interface BreakdownPayload {
   name: string;
-  total_seconds: number;
+  /** 可空：省略即 AI 自由定总时长（与系列单集同方案） */
+  total_seconds?: number;
   aspect: '9:16' | '16:9';
-  clip_seconds: string;
+  /** 可空：省略即 AI 自由切镜（plan 镜表优先） */
+  clip_seconds?: string;
   style: string;
   source_text: string;
+  /** 可选：所属系列名（传了后端加载该系列角色+场景库做资产注入与缺图检出） */
+  series?: string;
+}
+
+export interface MissingAsset {
+  clip_id: string;
+  field: string;
+  kind: string;
+  name: string;
+  planned_path: string;
 }
 
 export interface BreakdownResponse {
@@ -126,6 +138,8 @@ export interface BreakdownResponse {
   latency_ms?: number;
   source_chars?: number;
   truncated?: boolean;
+  missing_assets?: MissingAsset[];
+  note?: string;
 }
 
 /**

@@ -601,3 +601,56 @@ def test_clip_mux_skipped_when_final_exists(monkeypatch, tmp_path):
     w._run_clip_mux({"id": "s01"})
     assert calls == []
     assert marks == []
+
+
+def test_empty_dub_preserves_native_audio(tmp_path):
+    """B路线：对白镜传空dub即保留原音（无amix、直走loudnorm），不断言失败。"""
+    # filter 层：None/[] 均走无混音旧形状
+    for dubs in (None, []):
+        filt, vout, aout = build_mux_filter(2, [8.0, 8.0], dubs=dubs)
+        assert "amix" not in filt
+        assert "[a0]loudnorm[aout]" not in filt  # xfade 路 a_base 为 [m1]
+        assert "loudnorm[aout]" in filt
+        assert (vout, aout) == ("[x1]", "[aout]")
+    # command 层：dub_tracks=None/[] 均不追加输入、不断言失败
+    for tracks in (None, []):
+        cmd = build_mux_command(["a.mp4", "b.mp4"], None, "out.mp4",
+                                [8.0, 8.0], dub_tracks=tracks)
+        assert cmd.count("-i") == 2
+        filt = _filt(cmd)
+        assert "amix" not in filt and "dub0" not in filt
+        assert "loudnorm" in filt
+        assert _maps(cmd) == ["[x1]", "[aout]"]
+    # 全缺 wav 自动跳过同样保留原音形状
+    cmd = build_mux_command(["a.mp4", "b.mp4"], None, "out.mp4", [8.0, 8.0],
+                            dub_tracks=[(str(tmp_path / "nope.wav"), 0)])
+    assert cmd.count("-i") == 2
+    assert "amix" not in _filt(cmd)
+
+
+def test_ssml_preserves_plain_text_path():
+    """SSML轻增强不破坏纯文本路径：去标签还原原文，标点break可逆。"""
+    import re
+
+    from tts import build_narration_ssml
+
+    def _strip(ssml: str) -> str:
+        return re.sub(r"<[^>]+>", "", ssml)
+
+    plain = "你好世界今天天气不错"
+    ssml = build_narration_ssml(plain)
+    assert plain in _strip(ssml)
+    assert "<speak" in ssml and "<prosody" in ssml
+    # ，。→500ms，！？→800ms，且原文标点保留、去标签可逆
+    punct = "你好，今天不错。你确定吗？太棒了！"
+    ssml2 = build_narration_ssml(punct)
+    assert ssml2.count('break time="500ms"') == 2
+    assert ssml2.count('break time="800ms"') == 2
+    assert _strip(ssml2) == punct
+    # emotion 可选参：默认与显式均不破坏原文，仅调 rate/pitch
+    assert plain in _strip(build_narration_ssml(plain, emotion=""))
+    calm = build_narration_ssml(plain, emotion="calm")
+    assert plain in _strip(calm) and 'rate="-5%"' in calm
+    # XML 转义不破坏结构
+    esc = build_narration_ssml("A<B & C>")
+    assert "&lt;" in esc and "&amp;" in esc

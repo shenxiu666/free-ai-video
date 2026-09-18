@@ -198,6 +198,50 @@ export function buildQueueStreamUrl(name?: string): string {
   return name ? `${base}?name=${encodeURIComponent(name)}` : base
 }
 
+/** 系列选项（队列顶部剧下拉用；M2 新增）。 */
+export interface SeriesOptionDTO {
+  id: string
+  title: string
+  episode_count?: number
+  style?: string
+}
+
+/**
+ * GET /api/series：队列顶部剧下拉数据源。
+ * 无后端时抛中文连接错误，由 store 层降级本地索引（localStorage 系列索引）。
+ */
+export async function fetchSeriesIndex(): Promise<SeriesOptionDTO[]> {
+  const raw = await fetchJson<unknown>(`${QUEUE_API_BASE}/api/series`)
+  if (Array.isArray(raw)) {
+    return (raw as Array<Record<string, unknown>>)
+      .filter((x) => x && typeof x === 'object')
+      .map((r) => ({
+        id: String(r['id'] ?? r['series_id'] ?? r['title'] ?? ''),
+        title: String(r['title'] ?? r['name'] ?? r['id'] ?? ''),
+        episode_count: typeof r['episode_count'] === 'number' ? (r['episode_count'] as number) : undefined,
+        style: typeof r['style'] === 'string' ? (r['style'] as string) : undefined
+      }))
+      .filter((s) => !!s.id)
+  }
+  if (raw && typeof raw === 'object') {
+    const r = raw as Record<string, unknown>
+    for (const k of ['series', 'items', 'data', 'list']) {
+      if (Array.isArray(r[k])) {
+        return (r[k] as Array<Record<string, unknown>>)
+          .filter((x) => x && typeof x === 'object')
+          .map((e) => ({
+            id: String(e['id'] ?? e['series_id'] ?? e['title'] ?? ''),
+            title: String(e['title'] ?? e['name'] ?? e['id'] ?? ''),
+            episode_count: typeof e['episode_count'] === 'number' ? (e['episode_count'] as number) : undefined,
+            style: typeof e['style'] === 'string' ? (e['style'] as string) : undefined
+          }))
+          .filter((s) => !!s.id)
+      }
+    }
+  }
+  return []
+}
+
 /** POST /api/drama/{name}/start：开始渲染（全剧；重复点击后端 409）。 */
 export function startRenderRequest(name: string): Promise<{ note?: string }> {
   return fetchJson<{ ok?: boolean; note?: string }>(

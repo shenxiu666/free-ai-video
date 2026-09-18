@@ -13,7 +13,7 @@ import { useDramaStore, listLocalDrafts, deleteLocalDraft, type LocalDraftInfo }
 import { fetchModels, pickTextConfig } from '../api/drama';
 
 type ModelsState = 'checking' | 'ready' | 'missing' | 'unreachable';
-type TotalPreset = '60' | '90' | '120' | 'custom';
+type TotalPreset = 'ai' | '60' | '90' | '120' | 'custom';
 
 const router = useRouter();
 const store = useDramaStore();
@@ -23,15 +23,17 @@ const STYLES = ['电影感写实', '国风水墨', '赛博朋克', '日式动漫
 const title = ref('');
 const brief = ref('');
 const sourceText = ref('');
-const totalPreset = ref<TotalPreset>('60');
+const totalPreset = ref<TotalPreset>('ai');
 const customTotal = ref<number>(60);
 const aspect = ref<'9:16' | '16:9'>('9:16');
 const style = ref(STYLES[0]);
 const clipSeconds = ref<number>(8);
+const clipAuto = ref(true);
 
 const modelsState = ref<ModelsState>('checking');
 const textHint = ref('');
 const formError = ref('');
+const formWarning = ref('');
 const submitting = ref(false);
 const entered = ref(false);
 const drafts = ref<LocalDraftInfo[]>([]);
@@ -50,8 +52,13 @@ function removeDraft(d: LocalDraftInfo): void {
 }
 
 const totalSeconds = computed(() =>
-  totalPreset.value === 'custom' ? Math.floor(customTotal.value || 0) : Number(totalPreset.value),
+  totalPreset.value === 'ai'
+    ? undefined
+    : totalPreset.value === 'custom'
+      ? Math.floor(customTotal.value || 0)
+      : Number(totalPreset.value),
 );
+const clipSecondsOpt = computed(() => (clipAuto.value ? undefined : String(Math.floor(clipSeconds.value || 0))));
 const blockedByText = computed(() => modelsState.value === 'missing');
 
 onMounted(() => {
@@ -92,6 +99,7 @@ async function checkTextModel(): Promise<void> {
 
 async function onSubmit(): Promise<void> {
   formError.value = '';
+  formWarning.value = '';
   // 内联拒绝：text 留空 → 不发请求，直接指引去 /keys
   if (blockedByText.value) {
     formError.value = '文本模型未配置：请先去 /keys 设置页填写提供商 / 模型，本次未发请求。';
@@ -101,21 +109,30 @@ async function onSubmit(): Promise<void> {
     formError.value = '请填写题材（剧名）。';
     return;
   }
-  if (!Number.isFinite(totalSeconds.value) || totalSeconds.value < 60) {
-    formError.value = `总时长下限 60s，当前 ${String(totalSeconds.value)}s 不合法。`;
+  // M3 放宽：60s 硬阻断改为 >0 校验；<4s 仅警告（太短无法生成视频），仍允许建剧搭架子
+  // 统一方案：离线搭架子无 AI 可定，必须显式时长；AI 自由定请改用“AI 分解”
+  if (totalSeconds.value === undefined) {
+    formError.value = '离线建空剧需显式总时长（请选择 60/90/120/自定义）；AI 自由定请用“AI 分解并去分镜表”。';
     return;
   }
-  if (!Number.isFinite(clipSeconds.value) || clipSeconds.value < 4 || clipSeconds.value > 12) {
-    formError.value = '单镜时长需在 4-12s 之间。';
+  if (!Number.isFinite(totalSeconds.value) || (totalSeconds.value as number) <= 0) {
+    formError.value = `总时长须 > 0s，当前 ${String(totalSeconds.value)}s 不合法。`;
+    return;
+  }
+  if ((totalSeconds.value as number) < 4) {
+    formWarning.value = '提醒：总时长 <4s 太短无法生成视频（单镜视频至少 4s），仍可建剧搭架子。';
+  }
+  if (!clipAuto.value && (!Number.isFinite(clipSeconds.value) || clipSeconds.value < 4 || clipSeconds.value > 12)) {
+    formError.value = '单镜时长需在 4-12s 之间（或勾选 AI 自由切镜）。';
     return;
   }
   submitting.value = true;
   try {
     const result = await store.newDrama({
       title: title.value.trim(),
-      total_seconds: totalSeconds.value,
+      total_seconds: totalSeconds.value as number,
       aspect: aspect.value,
-      clip_seconds: String(clipSeconds.value),
+      clip_seconds: clipSecondsOpt.value ?? String(clipSeconds.value),
       style: style.value,
       brief: brief.value.trim(),
     });
@@ -132,6 +149,7 @@ async function onSubmit(): Promise<void> {
 /** AI 分解：原文 → 分镜初稿（后端不落盘，去分镜表检查修改后再保存）。 */
 async function onBreakdown(): Promise<void> {
   formError.value = '';
+  formWarning.value = '';
   if (blockedByText.value) {
     formError.value = '文本模型未配置：请先去 /keys 设置页填写提供商 / 模型，本次未发请求。';
     return;
@@ -144,21 +162,27 @@ async function onBreakdown(): Promise<void> {
     formError.value = '请粘贴小说/剧本原文后再分解（超长会自动截断前 12000 字）。';
     return;
   }
-  if (!Number.isFinite(totalSeconds.value) || totalSeconds.value < 60) {
-    formError.value = `总时长下限 60s，当前 ${String(totalSeconds.value)}s 不合法。`;
-    return;
+  // 统一方案（与系列单集一致）：总时长/单镜均可留空走 AI 自由发挥；显式才校验
+  if (totalSeconds.value !== undefined) {
+    if (!Number.isFinite(totalSeconds.value) || (totalSeconds.value as number) <= 0) {
+      formError.value = `总时长须 > 0s，当前 ${String(totalSeconds.value)}s 不合法。`;
+      return;
+    }
+    if ((totalSeconds.value as number) < 4) {
+      formWarning.value = '提醒：总时长 <4s 太短无法生成视频（单镜视频至少 4s），AI 仍会分解，成片需补足时长。';
+    }
   }
-  if (!Number.isFinite(clipSeconds.value) || clipSeconds.value < 4 || clipSeconds.value > 12) {
-    formError.value = '单镜时长需在 4-12s 之间。';
+  if (!clipAuto.value && (!Number.isFinite(clipSeconds.value) || clipSeconds.value < 4 || clipSeconds.value > 12)) {
+    formError.value = '单镜时长需在 4-12s 之间（或勾选 AI 自由切镜）。';
     return;
   }
   submitting.value = true;
   try {
     const result = await store.breakdown({
       name: title.value.trim(),
-      total_seconds: totalSeconds.value,
+      ...(totalSeconds.value !== undefined ? { total_seconds: totalSeconds.value as number } : {}),
       aspect: aspect.value,
-      clip_seconds: String(clipSeconds.value),
+      ...(clipSecondsOpt.value !== undefined ? { clip_seconds: clipSecondsOpt.value } : {}),
       style: style.value,
       source_text: sourceText.value,
     });
@@ -176,14 +200,18 @@ async function onBreakdown(): Promise<void> {
   <div class="page" :class="{ entered }">
     <header class="toolbar">
       <div class="toolbar-inner">
-        <span class="brand">新建短剧</span>
-        <router-link class="link" to="/keys">密钥池+设置</router-link>
+        <span class="brand">新建短剧（单集 · 兼容入口）</span>
+        <span>
+          <router-link class="link" to="/series/new">多集请走新建系列</router-link>
+          &nbsp;·&nbsp;
+          <router-link class="link" to="/keys">密钥池+设置</router-link>
+        </span>
       </div>
     </header>
 
     <main class="card">
-      <h1>新建短剧</h1>
-      <p class="sub">粘贴小说/剧本，AI 自动分解分镜（可在分镜表修改）· 60s 起步 · 文本模型需先在设置页配好</p>
+      <h1>新建短剧（单集）</h1>
+      <p class="sub">多集连续剧请走<router-link class="link" to="/series/new">新建系列</router-link>（可上传 N 集 md/txt）；本页为老单集兼容入口 · 时长 > 0s 即可 · 文本模型需先在设置页配好</p>
 
       <div v-if="modelsState === 'checking'" class="notice">正在检查文本模型（GET /models）…</div>
       <div v-else-if="modelsState === 'missing'" class="notice error">
@@ -210,8 +238,9 @@ async function onBreakdown(): Promise<void> {
         </label>
 
         <fieldset class="field">
-          <legend>总时长（下限 60s）</legend>
+          <legend>总时长（留空即 AI 自由定；显式须 > 0s；&lt;4s 暂无法生成视频，仅搭架子）</legend>
           <div class="radios">
+            <label><input v-model="totalPreset" type="radio" value="ai" /> AI自由定（推荐）</label>
             <label><input v-model="totalPreset" type="radio" value="60" /> 60s</label>
             <label><input v-model="totalPreset" type="radio" value="90" /> 90s</label>
             <label><input v-model="totalPreset" type="radio" value="120" /> 120s</label>
@@ -220,7 +249,7 @@ async function onBreakdown(): Promise<void> {
               v-if="totalPreset === 'custom'"
               v-model.number="customTotal"
               type="number"
-              min="60"
+              min="1"
               step="1"
               aria-label="自定义总时长（秒）"
             />
@@ -243,12 +272,14 @@ async function onBreakdown(): Promise<void> {
             </select>
           </label>
           <label class="field">
-            <span>单镜时长（秒，4-12，默认 8）</span>
-            <input v-model.number="clipSeconds" type="number" min="4" max="12" step="1" />
+            <span>单镜时长（默认 AI 自由切镜；手动须 4-12）</span>
+            <label><input v-model="clipAuto" type="checkbox" /> AI自由切镜（推荐）</label>
+            <input v-if="!clipAuto" v-model.number="clipSeconds" type="number" min="4" max="12" step="1" />
           </label>
         </div>
 
         <p v-if="formError" class="error-text" role="alert">{{ formError }}</p>
+        <p v-if="formWarning" class="warn-text" role="note">{{ formWarning }}</p>
 
         <div class="btn-row">
           <button class="primary" type="button" :disabled="submitting || blockedByText" @click="onBreakdown">
@@ -395,6 +426,10 @@ select:focus-visible {
 }
 .error-text {
   color: #d70015;
+  font-weight: 600;
+}
+.warn-text {
+  color: #9a6700;
   font-weight: 600;
 }
 .link {

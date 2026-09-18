@@ -75,6 +75,81 @@ def test_coerce_drops_media_and_defaults_prompts():
     assert script["resolution"] == "1280x720"
 
 
+# ---- AI 规划生成模式（reference/keyframe 为主，保留要图不降级） ----
+
+def test_coerce_keeps_reference_mode_and_scene():
+    raw = {"clips": [_raw_clip(
+        1, video_mode="reference",
+        images=["characters/c01_x.png", "scenes/s01_y.png",
+                "characters/c01_x.png"],
+        cast=["阿雪"], scene="雪夜山门",
+        audios=[], videos=["v.mp4"])]}
+    script = bd.coerce_script(raw, "剧", 8, "9:16", "8", "写实")
+    c = script["clips"][0]
+    assert c["video_mode"] == "reference"
+    assert c["images"] == ["characters/c01_x.png", "scenes/s01_y.png"]  # 去重保序
+    assert c["cast"] == ["阿雪"]
+    assert c["scene"] == ["雪夜山门"]  # 单字符串兼容为数组
+    assert "videos" not in c  # reference 禁 videos，直接丢弃
+    assert script["scene_refs"] == []
+
+
+def test_coerce_keeps_keyframe_even_without_frame():
+    # 初稿永不因缺图降级：无首尾帧也保留 keyframe（形态校验由 validate_script 把关）
+    raw = {"clips": [_raw_clip(1, video_mode="keyframe")]}
+    script = bd.coerce_script(raw, "剧", 8, "9:16", "8", "写实")
+    assert script["clips"][0]["video_mode"] == "keyframe"
+    assert "first_frame" not in script["clips"][0]
+    raw2 = {"clips": [_raw_clip(
+        1, video_mode="keyframe", first_frame="images/s01.png")]}
+    c2 = bd.coerce_script(raw2, "剧", 8, "9:16", "8", "写实")["clips"][0]
+    assert c2["first_frame"] == "images/s01.png"
+
+
+def test_find_missing_assets_keeps_placeholders_and_remote():
+    script = {"clips": [
+        {"id": "s01", "video_mode": "reference",
+         "images": ["characters/c01_x.png", "https://cdn/a.png"],
+         "cast": ["阿雪"], "scene": []},
+        {"id": "s02", "video_mode": "keyframe",
+         "first_frame": "images/s01.png"},
+        {"id": "s03", "video_mode": "reference",
+         "images": ["scenes/s09_z.png"], "scene": ["雪夜山门"]},
+    ]}
+    missing = bd.find_missing_assets(script, {"characters/c01_x.png"})
+    assert {(m["clip_id"], m["planned_path"]) for m in missing} == \
+        {("s03", "scenes/s09_z.png")}
+    assert missing[0]["kind"] == "scene"
+    # 占位 images/sNN.png 与 legacy shots/ 写法都不算缺
+    script2 = {"clips": [
+        {"id": "s02", "video_mode": "keyframe",
+         "first_frame": "shots/s01_last.png"}]}
+    assert bd.find_missing_assets(script2, set()) == []
+
+
+def test_inject_scene_description_keeps_six_segments():
+    base = ("[主体]少年+[场景]雪夜+[风格]写实+[光照]月光"
+            "+[构图]竖构图+[质量]1K,高细节")
+    out = bd.inject_scene_description(base, ["雪夜山门：青石台阶"])
+    assert "[场景]雪夜，取景：雪夜山门" in out
+    assert out.count("+[") == 5  # 六段式不破
+    assert bd.inject_scene_description(base, []) == base
+    assert bd.inject_scene_description("无段式", ["雪夜山门：x"]) == "无段式"
+
+
+def test_build_prompt_plans_mode_with_assets():
+    system, user = bd.build_breakdown_prompt(
+        "剧", 16, "9:16", "8", "写实", "少年雪夜下山" * 50,
+        characters_summary="- 阿雪：短发少女",
+        scenes_summary="- 雪夜山门（有图）：青石台阶",
+        asset_lines="角色立绘：\n- 阿雪：characters/c01_x.png\n"
+                    "场景图：\n- 雪夜山门：scenes/s01_y.png",
+        cast_plan=["阿雪"], scene_plan=["雪夜山门"])
+    assert "reference" in user and "keyframe" in user
+    assert "scene" in user and "characters/c01_x.png" in user
+    assert "不许自行降级" in user
+
+
 def test_coerce_requires_clips():
     with pytest.raises(ValueError):
         bd.coerce_script({}, "剧", 60, "9:16", "8", "")
@@ -190,7 +265,9 @@ def test_breakdown_api_validates_input():
 
     c = TestClient(m.app)
     base = {"name": "剧", "aspect": "9:16", "clip_seconds": "8", "source_text": "原文"}
-    assert c.post("/api/drama/breakdown", json={**base, "total_seconds": 30}).status_code == 400
+    # 契约放宽：total>0 即可（30s 不再拒绝）；0/负数仍 400
+    assert c.post("/api/drama/breakdown", json={**base, "total_seconds": 0}).status_code == 400
+    assert c.post("/api/drama/breakdown", json={**base, "total_seconds": -5}).status_code == 400
     assert c.post("/api/drama/breakdown", json={**base, "total_seconds": 60, "clip_seconds": "3"}).status_code == 400
     assert c.post("/api/drama/breakdown", json={**base, "total_seconds": 60, "source_text": "  "}).status_code == 400
 

@@ -16,6 +16,7 @@ const fromLocal = computed(() => String(route.query.local ?? '') === '1');
 const notice = ref('');
 const entered = ref(false);
 const newRef = ref('');
+const newSceneRef = ref('');
 
 const hasScript = computed(() => store.script !== null);
 const total = computed(() => store.script?.total_seconds ?? 0);
@@ -24,6 +25,31 @@ const consistent = computed(() => hasScript.value && store.durationConsistent);
 const validation = computed(() => store.validate());
 const clips = computed<ScriptClip[]>(() => store.script?.clips ?? []);
 const refs = computed(() => store.script?.character_refs ?? []);
+const sceneRefs = computed(() => store.script?.scene_refs ?? []);
+const missing = computed(() => store.missingAssets ?? []);
+
+/** M3：台词密度 = 全剧旁白+对白字数 / 总秒；与 store.validateScript 的超长规则同口径 */
+const totalChars = computed(() =>
+  clips.value.reduce(
+    (acc, c) =>
+      acc +
+      [...(c.narration ?? '')].length +
+      [...((c.dialogue ?? '') as string)].length,
+    0,
+  ),
+);
+const density = computed(() => (total.value > 0 ? totalChars.value / total.value : 0));
+const longDialogueCount = computed(
+  () =>
+    clips.value.filter((c) => {
+      const text = ((c.dialogue ?? '') as string).trim();
+      const len = [...text].length;
+      return len > 45 || (len > 30 && Number(c.duration) <= 8);
+    }).length,
+);
+const densityText = computed(
+  () => `密度 ${density.value.toFixed(1)} 字/s · 对白超长 ${longDialogueCount.value} 镜`,
+);
 
 onMounted(() => {
   requestAnimationFrame(() => {
@@ -86,6 +112,54 @@ function onRemoveRef(index: number): void {
   store.setCharacterRefs(refs.value.filter((_, i) => i !== index));
 }
 
+function onAddSceneRef(): void {
+  if (!store.script) return;
+  const v = newSceneRef.value.trim();
+  if (!v) return;
+  if (sceneRefs.value.length >= 5) {
+    notice.value = 'scene_refs 最多 5 张，拒绝添加';
+    return;
+  }
+  store.setSceneRefs([...sceneRefs.value, v]);
+  newSceneRef.value = '';
+  notice.value = '场景锚点已更新（本地草稿，记得保存全部）';
+}
+
+function onRemoveSceneRef(index: number): void {
+  if (!store.script) return;
+  store.setSceneRefs(sceneRefs.value.filter((_, i) => i !== index));
+}
+
+function onEditSceneRef(index: number, value: string): void {
+  if (!store.script) return;
+  const next = [...sceneRefs.value];
+  next[index] = value;
+  store.setSceneRefs(next);
+}
+
+/** cast / scene：逗号/顿号/空白分隔解析为 string[] */
+function parseNames(raw: string): string[] {
+  const out: string[] = [];
+  for (const s of raw.split(/[,，、\s\n]+/)) {
+    const t = s.trim();
+    if (t && !out.includes(t)) out.push(t);
+  }
+  return out;
+}
+
+function onCastInput(clip: ScriptClip, raw: string): void {
+  clip.cast = parseNames(raw);
+}
+
+function onSceneInput(clip: ScriptClip, raw: string): void {
+  clip.scene = parseNames(raw);
+}
+
+/** 本镜缺图项（AI 规划引用但库内尚无文件：去角色/场景页补传或 AI 生成后回填 images） */
+function missingFor(clipId: string): { field: string; kind: string; planned_path: string }[] {
+  return missing.value.filter((m) => m && m.clip_id === clipId);
+}
+
 function onEditRef(index: number, value: string): void {
   if (!store.script) return;
   const next = [...refs.value];
@@ -119,14 +193,14 @@ function onLinesInput(clip: ScriptClip, field: 'images' | 'audios', raw: string)
     .filter((s) => s.length > 0);
 }
 
-/** 沿用上一镜尾帧 → 本镜首帧（keyframe 链式衔接） */
+/** 沿用上一镜分镜图 → 本镜首帧（keyframe 链式衔接，与 runner 产物路径 images/ 统一） */
 function onChainFrame(index: number): void {
   const prev = clips.value[index - 1];
   const cur = clips.value[index];
   if (!prev || !cur) return;
-  const tail = (prev.last_frame || '').trim() || `shots/${prev.id}_last.png`;
+  const tail = (prev.last_frame || '').trim() || `images/${prev.id}.png`;
   cur.first_frame = tail;
-  notice.value = `${cur.id} 的首帧已沿用上一镜尾帧（本地草稿，记得保存本镜）`;
+  notice.value = `${cur.id} 的首帧已沿用上一镜分镜图（本地草稿，记得保存本镜）`;
 }
 
 function hasMediaLeft(clip: ScriptClip): boolean {
@@ -148,12 +222,21 @@ function hasMediaLeft(clip: ScriptClip): boolean {
         <span v-if="hasScript" class="sum" :class="{ bad: !consistent }">
           总 {{ total }}s / 和 {{ sum }}s
         </span>
+        <span v-if="hasScript" class="density" :title="`旁白+对白共 ${totalChars} 字`">
+          {{ densityText }}
+        </span>
         <button class="ghost" type="button" @click="onSaveAll">保存全部</button>
       </div>
     </header>
 
     <main class="wrap">
       <div v-if="fromLocal" class="notice warn">后端不可达，当前为本地草稿：编辑均先落本地，联网后点“保存全部”同步。</div>
+      <div v-if="missing.length > 0" class="notice warn">
+        待补图 {{ missing.length }} 处（AI 规划要图但库内尚无文件，模式已保留）：去角色/场景页补传或 AI 生成后，把回填路径粘进对应镜的参考图并保存。
+        <ul class="errlist">
+          <li v-for="(m, i) in missing" :key="'m' + i">{{ m.clip_id }} · {{ m.planned_path }}</li>
+        </ul>
+      </div>
       <div v-if="!hasScript && !store.loading" class="notice">
         {{ notice || '剧本为空：请先去新建剧，或检查 ?name= 参数。' }}
       </div>
@@ -178,6 +261,20 @@ function hasMediaLeft(clip: ScriptClip): boolean {
           </div>
         </section>
 
+        <section class="panel">
+          <h2>场景锚点（{{ sceneRefs.length }}/5）</h2>
+          <ul class="reflist">
+            <li v-for="(url, i) in sceneRefs" :key="'sc' + i">
+              <input :value="url" type="text" placeholder="scenes/…png 或 https://…场景图" @input="onEditSceneRef(i, ($event.target as HTMLInputElement).value)" />
+              <button type="button" @click="onRemoveSceneRef(i)">删</button>
+            </li>
+          </ul>
+          <div class="refadd">
+            <input v-model="newSceneRef" type="text" placeholder="粘贴场景图路径回车添加" @keyup.enter="onAddSceneRef" />
+            <button type="button" @click="onAddSceneRef">添加</button>
+          </div>
+        </section>
+
         <section v-for="(clip, index) in clips" :key="clip.id" class="panel shot">
           <div class="shot-head">
             <label>镜号 <input :value="clip.id" type="text" class="id" readonly title="镜号不可改名（改名请删镜重建，避免保存时按镜号查找失效）" /></label>
@@ -187,8 +284,34 @@ function hasMediaLeft(clip: ScriptClip): boolean {
           </div>
 
           <label class="field">
-            <span>台词</span>
+            <span>旁白（走 TTS）</span>
             <textarea v-model="clip.narration" rows="2"></textarea>
+          </label>
+          <label class="field">
+            <span>人物对白（B 路线视频原生发声，只进 video_prompt）</span>
+            <textarea v-model="clip.dialogue" rows="2" placeholder="人物原声台词，留空则本镜无对白"></textarea>
+          </label>
+          <label class="field">
+            <span>说话人（可选）</span>
+            <input v-model="clip.speaker" type="text" placeholder="如：女主 / 旁白" />
+          </label>
+          <label class="field">
+            <span>参演角色 cast（逗号/顿号分隔，AI 已规划，可手改）</span>
+            <input
+              :value="(clip.cast ?? []).join('，')"
+              type="text"
+              placeholder="如：阿雪，师尊"
+              @input="onCastInput(clip, ($event.target as HTMLInputElement).value)"
+            />
+          </label>
+          <label class="field">
+            <span>出场场景 scene（逗号/顿号分隔，AI 已规划，可手改）</span>
+            <input
+              :value="(clip.scene ?? []).join('，')"
+              type="text"
+              placeholder="如：雪夜山门"
+              @input="onSceneInput(clip, ($event.target as HTMLInputElement).value)"
+            />
           </label>
           <label class="field">
             <span>画面提示词（[主体+场景+风格+光照+构图+质量]）</span>
@@ -200,13 +323,20 @@ function hasMediaLeft(clip: ScriptClip): boolean {
           </label>
 
           <label class="field">
-            <span>生成模式</span>
+            <span>生成模式（AI 已规划，可手改）</span>
             <select v-model="clip.video_mode">
               <option value="text">纯文本</option>
               <option value="keyframe">首尾帧</option>
               <option value="reference">参考图</option>
             </select>
           </label>
+
+          <div v-if="missingFor(clip.id).length > 0" class="notice warn">
+            本镜待补图（模式已保留，补后把路径粘进参考图）：
+            <ul class="errlist">
+              <li v-for="(m, i) in missingFor(clip.id)" :key="'cm' + i">{{ m.planned_path }}</li>
+            </ul>
+          </div>
 
           <!-- 纯文本：隐藏全部媒体字段 -->
           <p v-if="clip.video_mode === 'text'" class="hint">纯文本模式禁止携带任何媒体字段。</p>
@@ -215,11 +345,11 @@ function hasMediaLeft(clip: ScriptClip): boolean {
           <div v-if="clip.video_mode === 'keyframe'" class="mediabox">
             <label class="field">
               <span>首帧</span>
-              <input v-model="clip.first_frame" type="text" placeholder="shots/s00_last.png" />
+              <input v-model="clip.first_frame" type="text" placeholder="images/s01.png（上一镜分镜图）" />
             </label>
             <label class="field">
               <span>尾帧（可选，与首帧至少其一）</span>
-              <input v-model="clip.last_frame" type="text" placeholder="shots/s01_last.png" />
+              <input v-model="clip.last_frame" type="text" placeholder="images/s02.png" />
             </label>
             <button v-if="index > 0" type="button" class="ghost" @click="onChainFrame(index)">
               沿用上一镜尾帧
@@ -252,6 +382,7 @@ function hasMediaLeft(clip: ScriptClip): boolean {
                 @input="onLinesInput(clip, 'audios', ($event.target as HTMLTextAreaElement).value)"
               ></textarea>
             </label>
+            <p class="hint">B路线原生发声：对白不填audios，留空即可</p>
             <p v-if="(clip.videos ?? []).length > 0" class="error-text" role="alert">
               参考图模式禁止携带视频，请清空后再保存。
             </p>
@@ -339,6 +470,14 @@ function hasMediaLeft(clip: ScriptClip): boolean {
 }
 .sum.bad {
   color: #d70015;
+}
+.density {
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  color: #6e6e73;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .wrap {
   max-width: 860px;
